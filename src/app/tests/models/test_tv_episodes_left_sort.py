@@ -35,6 +35,13 @@ class TVEpisodesLeftSortTests(TestCase):
 
     def setUp(self):
         """Track shows with different released and watched counts."""
+        # nothing here may reach the real TMDB: fail loudly if anything tries
+        blocker = patch(
+            "app.models.providers.services.get_media_metadata",
+            side_effect=AssertionError("test tried to contact TMDB"),
+        )
+        blocker.start()
+        self.addCleanup(blocker.stop)
         self.user = get_user_model().objects.create_user(
             username="test",
             password="12345",
@@ -75,20 +82,18 @@ class TVEpisodesLeftSortTests(TestCase):
                     content_number=released,
                     datetime=past,
                 )
-            for episode_number in range(1, watched + 1):
-                Episode.objects.create(
-                    related_season=season,
-                    item=Item.objects.create(
-                        media_id=media_id,
-                        source=Sources.TMDB.value,
-                        media_type=MediaTypes.EPISODE.value,
-                        season_number=1,
-                        episode_number=episode_number,
-                        title=title,
-                        image="http://example.com/image.jpg",
-                    ),
-                    end_date=past,
+            # in bulk: Episode.save() would look the season up on TMDB
+            items = Item.objects.bulk_create([
+                Item(
+                    media_id=media_id, source=Sources.TMDB.value,
+                    media_type=MediaTypes.EPISODE.value, season_number=1,
+                    episode_number=n, title=title, image="http://example.com/image.jpg",
                 )
+                for n in range(1, watched + 1)
+            ])
+            Episode.objects.bulk_create(
+                [Episode(related_season=season, item=i, end_date=past) for i in items],
+            )
 
     def titles(self):
         """Return the TV list titles sorted by episodes left."""

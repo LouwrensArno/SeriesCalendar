@@ -17,23 +17,23 @@ class TVListPreferencesTests(TestCase):
         self.user = get_user_model().objects.create_user(username="test")
 
     def test_defaults(self):
-        """A new user sorts TV by title and sees every status."""
+        """A new user sorts TV by title and starts on the Current filter."""
         self.assertEqual(self.user.tv_sort, TVSortChoices.TITLE)
-        self.assertEqual(self.user.tv_status, TVStatusChoices.ALL)
+        self.assertEqual(self.user.tv_status, TVStatusChoices.CURRENT)
 
     def test_new_options_are_accepted(self):
         """Every column the table can sort by, and every show status, is valid."""
         for value in ("title", "network", "next_episode", "seasons", "progress"):
             self.assertEqual(self.user.get_valid_preference("tv_sort", value), value)
-        for value in ("All", "airing", "ended", "canceled", "coming"):
+        for value in ("All", "current", "concluded"):
             self.assertEqual(self.user.get_valid_preference("tv_status", value), value)
 
     def test_old_options_are_refused(self):
         """The old tracking-status filter and removed sorts keep the current value."""
         for value in ("score", "start_date", "end_date"):
             self.assertEqual(self.user.get_valid_preference("tv_sort", value), "title")
-        for value in ("Completed", "In progress", "Planning", "Paused", "Dropped"):
-            self.assertEqual(self.user.get_valid_preference("tv_status", value), "All")
+        for value in ("Completed", "In progress", "Planning", "Paused", "Dropped", "airing", "ended", "canceled", "coming"):
+            self.assertEqual(self.user.get_valid_preference("tv_status", value), "current")
 
     def test_other_media_types_keep_their_options(self):
         """Only TV changed: movies still sort by rating and filter by tracking status."""
@@ -48,7 +48,7 @@ class TVListPreferencesTests(TestCase):
             "score",
         )
         self.assertEqual(
-            self.user.get_valid_preference("movie_status", "airing"),
+            self.user.get_valid_preference("movie_status", "current"),
             "All",
         )
 
@@ -92,7 +92,7 @@ class TVPreferencesMigrationTests(TestCase):
             )
         user_model.objects.filter(pk=kept.pk).update(
             tv_sort="progress",
-            tv_status="airing",
+            tv_status="All",
         )
 
         self.migration.reset_tv_preferences(apps, None)
@@ -100,7 +100,7 @@ class TVPreferencesMigrationTests(TestCase):
         old.refresh_from_db()
         kept.refresh_from_db()
         self.assertEqual((old.tv_sort, old.tv_status), ("title", "All"))
-        self.assertEqual((kept.tv_sort, kept.tv_status), ("progress", "airing"))
+        self.assertEqual((kept.tv_sort, kept.tv_status), ("progress", "All"))
 
     def test_reverse_restores_values_the_old_choices_accept(self):
         """Rolling back the migration doesn't leave values the old constraint rejects."""
@@ -108,7 +108,7 @@ class TVPreferencesMigrationTests(TestCase):
         user = user_model.objects.create_user(username="new")
         user_model.objects.filter(pk=user.pk).update(
             tv_sort="network",
-            tv_status="airing",
+            tv_status="current",
         )
 
         with without_check_constraints():

@@ -222,13 +222,16 @@ class Item(CalendarTriggerMixin, models.Model):
             events.tasks.reload_calendar(items_to_process=items_to_process)
 
 
-# TMDB's show statuses, grouped the way the TV list filters them.
+# TMDB's show statuses, grouped the way the TV list reads them.
 TV_SHOW_STATUS_GROUPS = {
     "airing": ("Returning Series",),
     "ended": ("Ended",),
     "canceled": ("Canceled",),
     "coming": ("In Production", "Planned", "Pilot"),
 }
+# A show is still running if it is airing or coming; it is over if it ended or was canceled.
+RUNNING_SHOW_STATUSES = TV_SHOW_STATUS_GROUPS["airing"] + TV_SHOW_STATUS_GROUPS["coming"]
+OVER_SHOW_STATUSES = TV_SHOW_STATUS_GROUPS["ended"] + TV_SHOW_STATUS_GROUPS["canceled"]
 
 
 class TVShowDetailsManager(models.Manager):
@@ -347,7 +350,7 @@ class MediaManager(models.Manager):
     ):
         """Get media list based on filters, sorting and search.
 
-        `show_status` (TV shows only) filters on where the show is in its run on TMDB.
+        `show_status` (TV shows only) is "current" or "concluded" (see TVStatusChoices).
         """
         model = apps.get_model(app_label="app", model_name=media_type)
         queryset = model.objects.filter(user=user.id)
@@ -355,10 +358,11 @@ class MediaManager(models.Manager):
         if status_filter != users.models.MediaStatusChoices.ALL:
             queryset = queryset.filter(status=status_filter)
 
-        if show_status and show_status != users.models.TVStatusChoices.ALL:
-            queryset = queryset.filter(
-                item__show_details__status__in=TV_SHOW_STATUS_GROUPS.get(show_status, ()),
-            )
+        if show_status in (
+            users.models.TVStatusChoices.CURRENT,
+            users.models.TVStatusChoices.CONCLUDED,
+        ):
+            queryset = queryset.filter(pk__in=self._tv_ids_in_run(user, show_status))
 
         if search:
             search_filter = Q(item__title__icontains=search)
@@ -489,6 +493,47 @@ class MediaManager(models.Manager):
         # Default to generic sorting
         return self._sort_generic_media_list(queryset, sort_filter)
 
+    @staticmethod
+    def episodes_left(tv):
+        """Released episodes of a show (max_progress) that have not been watched yet."""
+        return max((tv.max_progress or 0) - tv.progress, 0)
+
+    def _tv_ids_in_run(self, user, run):
+        """Ids of the user's TV shows that are Current or Concluded.
+
+        Current: airing or coming on TMDB, or ANY show with released episodes left to
+        watch (so an ended show you are still catching up on counts).
+        Concluded: ended or canceled on TMDB with nothing left to watch.
+        A show whose TMDB status isn't known yet (details not fetched) counts as Current,
+        never Concluded: it must not vanish from the default list, and showing it is
+        what gets its details fetched.
+        Episodes left needs the released and watched counts, which are not database
+        columns, so the user's shows are counted here.
+        """
+        shows = list(
+            self._apply_prefetch_related(
+                TV.objects.filter(user=user.id).select_related(
+                    "item",
+                    "item__show_details",
+                ),
+                MediaTypes.TV.value,
+            ),
+        )
+        self.annotate_max_progress(shows, MediaTypes.TV.value)
+
+        wanted = set()
+        for tv in shows:
+            details = getattr(tv.item, "show_details", None)
+            status = details.status if details else ""
+            has_episodes_left = self.episodes_left(tv) > 0
+            if run == users.models.TVStatusChoices.CURRENT:
+                in_run = not status or status in RUNNING_SHOW_STATUSES or has_episodes_left
+            else:
+                in_run = status in OVER_SHOW_STATUSES and not has_episodes_left
+            if in_run:
+                wanted.add(tv.pk)
+        return wanted
+
     def _sort_tv_by_episodes_left(self, queryset):
         """Sort TV shows by how many released episodes are still unwatched, most first.
 
@@ -501,10 +546,7 @@ class MediaManager(models.Manager):
         self.annotate_max_progress(tv_list, MediaTypes.TV.value)
         return sorted(
             tv_list,
-            key=lambda tv: (
-                -max(tv.max_progress - tv.progress, 0),
-                tv.item.title.lower(),
-            ),
+            key=lambda tv: (-self.episodes_left(tv), tv.item.title.lower()),
         )
 
     def _sort_season_media_list(self, queryset, sort_filter):

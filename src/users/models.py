@@ -67,13 +67,15 @@ class TVSortChoices(models.TextChoices):
 
 
 class TVStatusChoices(models.TextChoices):
-    """Choices for the TV shows list filter: where each show is in its run on TMDB."""
+    """Choices for the TV shows list filter: shows still running or with episodes to watch.
+
+    Current: airing or coming on TMDB, or any show with released episodes still unwatched.
+    Concluded: ended or canceled on TMDB, with no released episodes left to watch.
+    """
 
     ALL = "All", _("All")
-    AIRING = "airing", _("Airing")
-    ENDED = "ended", _("Ended")
-    CANCELED = "canceled", _("Canceled")
-    COMING = "coming", _("Coming")
+    CURRENT = "current", _("Current")
+    CONCLUDED = "concluded", _("Concluded")
 
 
 class LayoutChoices(models.TextChoices):
@@ -178,7 +180,7 @@ class User(AbstractUser):
     )
     tv_status = models.CharField(
         max_length=20,
-        default=TVStatusChoices.ALL,
+        default=TVStatusChoices.CURRENT,
         choices=TVStatusChoices,
     )
 

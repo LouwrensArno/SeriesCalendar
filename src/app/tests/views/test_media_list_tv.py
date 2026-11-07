@@ -52,9 +52,28 @@ class TVListViewTests(TestCase):
 
     def shown(self, **params):
         """Return the titles on the page, in order."""
-        response = self.client.get(self.url, {"layout": "table", **params})
+        response = self.client.get(self.url, {"layout": "table", "status": "All", **params})
         self.assertEqual(response.status_code, 200)
         return [tv.item.title for tv in response.context["media_list"]]
+
+    def test_the_list_starts_on_current(self):
+        """With nothing chosen yet, the list shows Current: the ended show is hidden."""
+        response = self.client.get(self.url, {"layout": "table"})
+
+        self.assertEqual(response.context["current_status"], "current")
+        self.assertEqual(
+            [tv.item.title for tv in response.context["media_list"]],
+            ["Bravo Show", "Charlie Show"],
+        )
+
+    def test_choosing_all_is_remembered(self):
+        """Switching to All shows everything, and the next visit stays on All."""
+        self.client.get(self.url, {"layout": "table", "status": "All"})
+
+        response = self.client.get(self.url, {"layout": "table"})
+
+        self.assertEqual(response.context["current_status"], "All")
+        self.assertEqual(len(response.context["media_list"]), 3)
 
     def test_offers_filters_and_sorts_that_match_the_columns(self):
         """The dropdowns list the show statuses and the table's columns."""
@@ -62,7 +81,7 @@ class TVListViewTests(TestCase):
 
         self.assertEqual(
             [label for _, label in response.context["status_choices"]],
-            ["All", "Airing", "Ended", "Canceled", "Coming"],
+            ["All", "Current", "Concluded"],
         )
         self.assertEqual(
             [label for _, label in response.context["sort_choices"]],
@@ -78,18 +97,21 @@ class TVListViewTests(TestCase):
         status_labels = [label for _, label in response.context["status_choices"]]
         sort_labels = [label for _, label in response.context["sort_choices"]]
         self.assertIn("Completed", status_labels)
-        self.assertNotIn("Airing", status_labels)
+        self.assertNotIn("Current", status_labels)
         self.assertIn("Rating", sort_labels)
         self.assertNotIn("Network", sort_labels)
 
-    def test_filter_by_show_status(self):
-        """Airing keeps the returning shows; Ended keeps the ended one."""
+    def test_filter_current_and_concluded(self):
+        """Current keeps the running shows; Concluded the ended one (nothing left to watch)."""
         self.assertEqual(
-            self.shown(status="airing", sort="title"),
+            self.shown(status="current", sort="title"),
             ["Bravo Show", "Charlie Show"],
         )
-        self.assertEqual(self.shown(status="ended", sort="title"), ["Alpha Show"])
-        self.assertEqual(self.shown(status="canceled", sort="title"), [])
+        self.assertEqual(self.shown(status="concluded", sort="title"), ["Alpha Show"])
+        self.assertEqual(
+            self.shown(status="All", sort="title"),
+            ["Alpha Show", "Bravo Show", "Charlie Show"],
+        )
 
     def test_sorting(self):
         """Sorting follows the columns."""
@@ -108,22 +130,27 @@ class TVListViewTests(TestCase):
 
     def test_choices_are_remembered_between_visits(self):
         """The chosen sort and filter are saved on the user, like the other lists."""
-        self.shown(sort="network", status="airing")
+        self.shown(sort="network", status="current")
 
         self.user.refresh_from_db()
         self.assertEqual(self.user.tv_sort, "network")
-        self.assertEqual(self.user.tv_status, "airing")
+        self.assertEqual(self.user.tv_status, "current")
 
     def test_old_filter_and_sort_values_are_ignored(self):
         """A bookmarked URL with the old options still loads, using the current ones."""
+        # an unknown filter changes nothing: the list stays on the user's saved one (Current)
+        current = ["Bravo Show", "Charlie Show"]
+        for old in ("Completed", "airing", "ended", "canceled", "coming"):
+            self.assertEqual(self.shown(status=old, sort="title"), current, old)
+        # an unknown sort changes nothing either: it stays on Title
         self.assertEqual(
-            self.shown(status="Completed", sort="score"),
+            self.shown(status="All", sort="score"),
             ["Alpha Show", "Bravo Show", "Charlie Show"],
         )
 
     def test_table_shows_the_stored_details_and_not_the_old_columns(self):
         """The table renders network, status and seasons; the old columns are gone."""
-        response = self.client.get(self.url, {"layout": "table", "sort": "title"})
+        response = self.client.get(self.url, {"layout": "table", "sort": "title", "status": "All"})
 
         content = response.content.decode()
         for expected in ("AMC", "ABC, FOX", "Airing", "Ended", ">Network<", ">Episodes<"):

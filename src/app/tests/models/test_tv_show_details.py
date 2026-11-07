@@ -235,18 +235,25 @@ class TVShowDetailsListTests(TestCase):
         )
         return [tv.item.title for tv in queryset]
 
-    def test_filter_by_show_status(self):
-        """Each filter shows the shows in that part of their run."""
+    def test_current_is_airing_or_coming_and_concluded_is_ended_or_canceled(self):
+        """With no released episodes to watch, the show's TMDB status decides."""
         self.assertEqual(
-            self.titles(show_status="airing"),
-            ["Bravo Show", "Echo Show"],
+            self.titles(show_status="current"),
+            # Returning, In Production, Returning, and Zulu: no status known yet
+            ["Bravo Show", "Delta Show", "Echo Show", "Zulu Show"],
         )
-        self.assertEqual(self.titles(show_status="ended"), ["Alpha Show"])
-        self.assertEqual(self.titles(show_status="canceled"), ["Charlie Show"])
-        self.assertEqual(self.titles(show_status="coming"), ["Delta Show"])
+        self.assertEqual(
+            self.titles(show_status="concluded"),
+            ["Alpha Show", "Charlie Show"],  # Ended, Canceled
+        )
+
+    def test_a_show_without_details_is_current_so_it_is_shown_and_gets_fetched(self):
+        """No status yet: Current (never Concluded), so the default list keeps it."""
+        self.assertIn("Zulu Show", self.titles(show_status="current"))
+        self.assertNotIn("Zulu Show", self.titles(show_status="concluded"))
 
     def test_all_shows_everything_including_shows_without_details(self):
-        """'All' (or no filter) keeps shows TMDB hasn't been asked about yet."""
+        """'All' (or no filter) is no filtering: shows TMDB hasn't been asked about stay."""
         everything = [
             "Alpha Show",
             "Bravo Show",
