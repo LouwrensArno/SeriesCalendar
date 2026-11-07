@@ -10,6 +10,7 @@ from django.utils.translation import gettext as _
 from app import helpers
 from app.models import MediaTypes, Sources
 from app.providers import services
+from app.providers.streaming_extras import add_extra_providers
 
 logger = logging.getLogger(__name__)
 base_url = "https://api.themoviedb.org/3"
@@ -246,7 +247,11 @@ def movie(media_id):
             "external_links": get_external_links(
                 response.get("external_ids", {}), media_id
             ),
-            "providers": response.get("watch/providers", {}).get("results", {}),
+            "providers": add_extra_providers(
+                response.get("watch/providers", {}).get("results", {}),
+                MediaTypes.MOVIE.value,
+                media_id,
+            ),
         }
 
         cache.set(cache_key, data)
@@ -282,6 +287,11 @@ def enrich_season_with_tv_data(season_data, tv_data, media_id, season_number):
     season_data["tvdb_id"] = tv_data["tvdb_id"]
     season_data["external_links"] = tv_data["external_links"]
     season_data["genres"] = tv_data["genres"]
+    season_data["providers"] = add_extra_providers(
+        season_data.get("providers"),
+        MediaTypes.TV.value,
+        media_id,
+    )
     if season_data["synopsis"] == "No synopsis available.":
         season_data["synopsis"] = tv_data["synopsis"]
     # seasons often have no poster of their own, use the show's instead
@@ -470,7 +480,11 @@ def process_tv(response):
         "last_episode_season": last_episode["season_number"] if last_episode else None,
         "next_episode_season": next_episode["season_number"] if next_episode else None,
         "next_episode_air_date": next_episode["air_date"] if next_episode else None,
-        "providers": response.get("watch/providers", {}).get("results", {}),
+        "providers": add_extra_providers(
+            response.get("watch/providers", {}).get("results", {}),
+            MediaTypes.TV.value,
+            response["id"],
+        ),
     }
 
 
