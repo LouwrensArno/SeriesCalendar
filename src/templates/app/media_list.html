@@ -147,17 +147,24 @@
           <thead class="text-left text-gray-400 text-sm">
             <tr>
               <th class="p-2 w-15"></th>
-              <th class="p-2 pe-8 w-2/5">{% trans "Title" %}</th>
-              <th class="p-2 text-center">{% trans "Score" %}</th>
-              {% if media_type != MediaTypes.MOVIE.value %}
-                <th class="p-2 text-center">{% trans "Progress" %}</th>
-              {% endif %}
+              <th class="p-2 pe-8 {% if media_type == MediaTypes.TV.value %}w-1/4{% else %}w-2/5{% endif %}">{% trans "Title" %}</th>
               {% if media_type == MediaTypes.TV.value %}
-                <th class="p-2 text-center">{% trans "Last Watched" %}</th>
+                {# TV shows: TMDB's own show details instead of the tracking columns #}
+                <th class="p-2 text-center whitespace-nowrap">{% trans "Network" %}</th>
+                <th class="p-2 text-center whitespace-nowrap">{% trans "Where to Watch" %}</th>
+                <th class="p-2 text-center whitespace-nowrap">{% trans "Status" %}</th>
+                <th class="p-2 text-center whitespace-nowrap">{% trans "Next Episode" %}</th>
+                <th class="p-2 text-center whitespace-nowrap">{% trans "Seasons" %}</th>
+                <th class="p-2 text-center w-40 whitespace-nowrap">{% trans "Episodes" %}</th>
+              {% else %}
+                <th class="p-2 text-center">{% trans "Score" %}</th>
+                {% if media_type != MediaTypes.MOVIE.value %}
+                  <th class="p-2 text-center">{% trans "Progress" %}</th>
+                {% endif %}
+                <th class="p-2 text-center">{% trans "Status" %}</th>
+                <th class="p-2 text-center">{% trans "Start Date" %}</th>
+                <th class="p-2 text-center">{% trans "End Date" %}</th>
               {% endif %}
-              <th class="p-2 text-center">{% trans "Status" %}</th>
-              <th class="p-2 text-center">{% trans "Start Date" %}</th>
-              <th class="p-2 text-center">{% trans "End Date" %}</th>
             </tr>
           </thead>
           <tbody>

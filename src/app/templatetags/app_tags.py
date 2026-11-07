@@ -11,9 +11,27 @@ from unidecode import unidecode
 
 from app import config, helpers
 from app.models import MediaTypes, Sources, Status
+from app.providers import tmdb
 from users.models import WATCH_PROVIDER_REGION_UNSET
 
 register = template.Library()
+
+
+@register.simple_tag
+def show_watch_providers(details, user):
+    """Return where to stream a TV show in the user's region (with logo URLs), best first.
+
+    `details` is the show's stored TMDB details. Empty if it has none, the region isn't
+    set (or the feature is switched off), or nothing streams it there.
+    """
+    if not details or not details.providers:
+        return []
+    streaming = tmdb.filter_providers(details.providers, user.watch_provider_region)
+    # TMDB sometimes lists one service under two ids (e.g. "Apple TV" twice): show it once
+    unique = {}
+    for provider in streaming or []:
+        unique.setdefault(provider["provider_name"], provider)
+    return list(unique.values())
 
 
 @register.simple_tag

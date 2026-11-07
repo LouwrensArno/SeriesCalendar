@@ -30,6 +30,7 @@ from app.models import (
     Season,
     Sources,
     Status,
+    TVShowDetails,
     UserMessage,
 )
 from app.providers import manual, services, tmdb
@@ -40,6 +41,8 @@ from users.models import (
     HomeSortChoices,
     MediaSortChoices,
     MediaStatusChoices,
+    TVSortChoices,
+    TVStatusChoices,
     User,
 )
 
@@ -218,13 +221,19 @@ def media_list(request, username, media_type):
     if not status_filter:
         status_filter = MediaStatusChoices.ALL
 
+    # TV shows: the filter is where the show is in its run on TMDB (Airing, Ended...),
+    # not the user's own tracking status
+    is_tv = media_type == MediaTypes.TV.value
+    show_status = status_filter if is_tv else None
+
     # Get media list with filters applied
     media_queryset = BasicMedia.objects.get_media_list(
         user=target_user,
         media_type=media_type,
-        status_filter=status_filter,
+        status_filter=MediaStatusChoices.ALL if is_tv else status_filter,
         sort_filter=sort_filter,
         search=search_query,
+        show_status=show_status,
     )
 
     # Paginate results
@@ -237,6 +246,14 @@ def media_list(request, username, media_type):
         media_type,
     )
 
+    if is_tv:
+        # Shows on this page that have no TMDB details yet (or stale ones) get them now;
+        # the rest of the list is kept up to date by the daily "Refresh TV show details" task.
+        items = [tv.item for tv in media_page.object_list]
+        if TVShowDetails.objects.refresh(items):
+            for item in items:
+                item._state.fields_cache.pop("show_details", None)  # noqa: SLF001
+
     context = {
         "media_type": media_type,
         "media_type_plural": app_tags.media_type_readable_plural(media_type).lower(),
@@ -245,8 +262,10 @@ def media_list(request, username, media_type):
         "layout_class": ".media-grid" if layout == "grid" else "tbody",
         "current_sort": sort_filter,
         "current_status": status_filter,
-        "sort_choices": MediaSortChoices.choices,
-        "status_choices": MediaStatusChoices.choices,
+        "sort_choices": TVSortChoices.choices if is_tv else MediaSortChoices.choices,
+        "status_choices": (
+            TVStatusChoices.choices if is_tv else MediaStatusChoices.choices
+        ),
         "target_user": target_user,
     }
 

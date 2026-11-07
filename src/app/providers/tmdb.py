@@ -453,6 +453,7 @@ def process_tv(response):
             "country": get_country(response["production_countries"]),
             "languages": get_languages(response["spoken_languages"]),
         },
+        "networks": get_networks(response.get("networks")),
         "related": {
             "seasons": get_related(
                 response["seasons"],
@@ -468,6 +469,7 @@ def process_tv(response):
         "external_links": get_external_links(response.get("external_ids", {})),
         "last_episode_season": last_episode["season_number"] if last_episode else None,
         "next_episode_season": next_episode["season_number"] if next_episode else None,
+        "next_episode_air_date": next_episode["air_date"] if next_episode else None,
         "providers": response.get("watch/providers", {}).get("results", {}),
     }
 
@@ -635,6 +637,14 @@ def get_companies(companies):
     return None
 
 
+def get_networks(networks):
+    """Return the names of the networks the show airs on."""
+    # when unknown networks, value from response is empty list
+    if networks:
+        return [network["name"] for network in networks]
+    return []
+
+
 def get_score(score):
     """Return the score for the media with one decimal place."""
     # when unknown score, value from response is 0.0
@@ -691,6 +701,30 @@ def get_collection(collection_response):
         }
         for media in parts
     ]
+
+
+def get_streaming_providers(all_providers):
+    """Keep the free and subscription providers of every region, with only the fields shown.
+
+    The result has the same shape as TMDB's own (and is what filter_providers reads),
+    just much smaller: rent/buy options and unused fields are dropped.
+    """
+    streaming = {}
+    for region, kinds in (all_providers or {}).items():
+        by_kind = {
+            kind: [
+                {
+                    key: provider.get(key)
+                    for key in ("provider_id", "provider_name", "logo_path", "display_priority")
+                }
+                for provider in kinds.get(kind, [])
+            ]
+            for kind in ("flatrate", "free")
+            if kinds.get(kind)
+        }
+        if by_kind:
+            streaming[region] = by_kind
+    return streaming
 
 
 def filter_providers(all_providers, region):

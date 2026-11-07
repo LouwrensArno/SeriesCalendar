@@ -1,6 +1,8 @@
 import logging
 import uuid
+from datetime import timedelta
 
+import requests
 from django.apps import apps
 from django.conf import settings
 from django.core.validators import (
@@ -21,6 +23,7 @@ from django.db.models import (
 )
 from django.db.models.functions import RowNumber
 from django.utils import timezone, translation
+from django.utils.dateparse import parse_date
 from django.utils.translation import gettext_lazy as _
 from django.utils.translation import ngettext_lazy
 from model_utils import FieldTracker
@@ -219,6 +222,113 @@ class Item(CalendarTriggerMixin, models.Model):
             events.tasks.reload_calendar(items_to_process=items_to_process)
 
 
+# TMDB's show statuses, grouped the way the TV list filters them.
+TV_SHOW_STATUS_GROUPS = {
+    "airing": ("Returning Series",),
+    "ended": ("Ended",),
+    "canceled": ("Canceled",),
+    "coming": ("In Production", "Planned", "Pilot"),
+}
+
+
+class TVShowDetailsManager(models.Manager):
+    """Keeps TVShowDetails in step with TMDB."""
+
+    def refresh(self, items, *, max_age=timedelta(days=1), force=False):
+        """Fetch TMDB's current details for the TV shows whose stored details need it.
+
+        A show needs it when it has no details yet, they are older than `max_age`,
+        or its stored next air date has passed (a newer episode is probably scheduled).
+        A show TMDB can't be reached for keeps whatever it had, so one failure never
+        stops the rest. Returns how many shows were refreshed.
+        """
+        tv_items = [
+            item
+            for item in items
+            if item.media_type == MediaTypes.TV.value
+            and item.source == Sources.TMDB.value
+        ]
+        existing = {d.item_id: d for d in self.filter(item__in=tv_items)}
+        today = timezone.localdate()
+        cutoff = timezone.now() - max_age
+        refreshed = 0
+
+        for item in tv_items:
+            current = existing.get(item.id)
+            if not (
+                force
+                or current is None
+                or current.providers is None
+                or current.refreshed_at < cutoff
+                or (current.next_air_date and current.next_air_date < today)
+            ):
+                continue
+
+            try:
+                metadata = providers.services.get_media_metadata(
+                    MediaTypes.TV.value,
+                    item.media_id,
+                    item.source,
+                )
+            except (providers.services.ProviderAPIError, requests.RequestException):
+                logger.warning("Could not load show details for %s", item)
+                continue
+
+            details = metadata.get("details", {})
+            next_air_date = metadata.get("next_episode_air_date")
+            self.update_or_create(
+                item=item,
+                defaults={
+                    "status": details.get("status") or "",
+                    "networks": ", ".join(metadata.get("networks") or [])[:255],
+                    "season_count": details.get("seasons"),
+                    "next_air_date": parse_date(next_air_date)
+                    if next_air_date
+                    else None,
+                    "providers": providers.tmdb.get_streaming_providers(
+                        metadata.get("providers"),
+                    ),
+                    "refreshed_at": timezone.now(),
+                },
+            )
+            refreshed += 1
+
+        return refreshed
+
+
+class TVShowDetails(models.Model):
+    """TMDB's current details for a TV show, kept so the TV list can filter and sort.
+
+    Filled in as shows are viewed, and refreshed daily by the "Refresh TV show
+    details" task.
+    """
+
+    item = models.OneToOneField(
+        Item,
+        on_delete=models.CASCADE,
+        related_name="show_details",
+    )
+    status = models.CharField(max_length=40, blank=True, default="")  # TMDB's wording
+    networks = models.CharField(max_length=255, blank=True, default="")  # "ABC, FOX"
+    season_count = models.PositiveSmallIntegerField(null=True, blank=True)
+    next_air_date = models.DateField(null=True, blank=True)
+    # Where to watch, per region: {"US": {"flatrate": [{provider_id, provider_name, ...}]}}.
+    # None means never fetched (details stored before this field existed).
+    providers = models.JSONField(null=True, blank=True, default=None)
+    refreshed_at = models.DateTimeField(default=timezone.now)
+
+    objects = TVShowDetailsManager()
+
+    class Meta:
+        """Meta options for the model."""
+
+        verbose_name_plural = "TV show details"
+
+    def __str__(self):
+        """Return the name of the show the details belong to."""
+        return f"{self.item} ({self.status or 'unknown'})"
+
+
 class MediaManager(models.Manager):
     """Custom manager for media models."""
 
@@ -226,13 +336,29 @@ class MediaManager(models.Manager):
         """Return list of historical model names."""
         return [f"historical{media_type}" for media_type in MediaTypes.values]
 
-    def get_media_list(self, user, media_type, status_filter, sort_filter, search=None):
-        """Get media list based on filters, sorting and search."""
+    def get_media_list(  # noqa: PLR0913
+        self,
+        user,
+        media_type,
+        status_filter,
+        sort_filter,
+        search=None,
+        show_status=None,
+    ):
+        """Get media list based on filters, sorting and search.
+
+        `show_status` (TV shows only) filters on where the show is in its run on TMDB.
+        """
         model = apps.get_model(app_label="app", model_name=media_type)
         queryset = model.objects.filter(user=user.id)
 
         if status_filter != users.models.MediaStatusChoices.ALL:
             queryset = queryset.filter(status=status_filter)
+
+        if show_status and show_status != users.models.TVStatusChoices.ALL:
+            queryset = queryset.filter(
+                item__show_details__status__in=TV_SHOW_STATUS_GROUPS.get(show_status, ()),
+            )
 
         if search:
             search_filter = Q(item__title__icontains=search)
@@ -253,6 +379,8 @@ class MediaManager(models.Manager):
         ).filter(row_number=1)
 
         queryset = queryset.select_related("item")
+        if media_type == MediaTypes.TV.value:
+            queryset = queryset.select_related("item__show_details")
         queryset = self._apply_prefetch_related(queryset, media_type)
 
         if sort_filter:
@@ -329,22 +457,55 @@ class MediaManager(models.Manager):
                 models.functions.Lower("item__title"),
             )
 
-        if sort_filter == "progress":
-            # Annotate with the sum of episodes watched (excluding season 0)
+        # The TV list's columns that come from TMDB (see TVShowDetails); shows without
+        # details yet, or without a value, go last.
+        if sort_filter == "network":
             queryset = queryset.annotate(
-                # Count episodes in regular seasons (season_number > 0)
-                calculated_progress=models.Count(
-                    "seasons__episodes",
-                    filter=models.Q(seasons__item__season_number__gt=0),
+                network_sort=models.functions.NullIf(
+                    models.functions.Lower("item__show_details__networks"),
+                    models.Value(""),
                 ),
             )
             return queryset.order_by(
-                "-calculated_progress",
+                models.F("network_sort").asc(nulls_last=True),
                 models.functions.Lower("item__title"),
             )
 
+        if sort_filter == "next_episode":
+            return queryset.order_by(
+                models.F("item__show_details__next_air_date").asc(nulls_last=True),
+                models.functions.Lower("item__title"),
+            )
+
+        if sort_filter == "seasons":
+            return queryset.order_by(
+                models.F("item__show_details__season_count").desc(nulls_last=True),
+                models.functions.Lower("item__title"),
+            )
+
+        if sort_filter == "progress":
+            return self._sort_tv_by_episodes_left(queryset)
+
         # Default to generic sorting
         return self._sort_generic_media_list(queryset, sort_filter)
+
+    def _sort_tv_by_episodes_left(self, queryset):
+        """Sort TV shows by how many released episodes are still unwatched, most first.
+
+        That is the difference between the available (released) and watched counts the
+        Episodes column shows. Neither is a database column, so the whole list is
+        counted here and returned as a list. A show that is caught up, or ahead of
+        what has been released, counts as 0 left; ties go alphabetically.
+        """
+        tv_list = list(queryset)
+        self.annotate_max_progress(tv_list, MediaTypes.TV.value)
+        return sorted(
+            tv_list,
+            key=lambda tv: (
+                -max(tv.max_progress - tv.progress, 0),
+                tv.item.title.lower(),
+            ),
+        )
 
     def _sort_season_media_list(self, queryset, sort_filter):
         """Sort Season media list based on the sort criteria."""

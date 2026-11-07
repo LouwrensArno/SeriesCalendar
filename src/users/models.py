@@ -56,6 +56,26 @@ class MediaStatusChoices(models.TextChoices):
     DROPPED = Status.DROPPED.value, Status.DROPPED.label
 
 
+class TVSortChoices(models.TextChoices):
+    """Choices for the TV shows list sort options (they follow the table's columns)."""
+
+    TITLE = "title", _("Title")
+    NETWORK = "network", _("Network")
+    NEXT_EPISODE = "next_episode", _("Next Episode")
+    SEASONS = "seasons", _("Seasons")
+    PROGRESS = "progress", _("Episodes")
+
+
+class TVStatusChoices(models.TextChoices):
+    """Choices for the TV shows list filter: where each show is in its run on TMDB."""
+
+    ALL = "All", _("All")
+    AIRING = "airing", _("Airing")
+    ENDED = "ended", _("Ended")
+    CANCELED = "canceled", _("Canceled")
+    COMING = "coming", _("Coming")
+
+
 class LayoutChoices(models.TextChoices):
     """Choices for media list layout options."""
 
@@ -153,13 +173,13 @@ class User(AbstractUser):
     )
     tv_sort = models.CharField(
         max_length=20,
-        default=MediaSortChoices.SCORE,
-        choices=MediaSortChoices,
+        default=TVSortChoices.TITLE,
+        choices=TVSortChoices,
     )
     tv_status = models.CharField(
         max_length=20,
-        default=MediaStatusChoices.ALL,
-        choices=MediaStatusChoices,
+        default=TVStatusChoices.ALL,
+        choices=TVStatusChoices,
     )
 
     # Media type preferences: TV Seasons
@@ -489,7 +509,7 @@ class User(AbstractUser):
             ),
             models.CheckConstraint(
                 name="tv_sort_valid",
-                condition=models.Q(tv_sort__in=MediaSortChoices.values),
+                condition=models.Q(tv_sort__in=TVSortChoices.values),
             ),
             models.CheckConstraint(
                 name="season_sort_valid",
@@ -533,7 +553,7 @@ class User(AbstractUser):
             ),
             models.CheckConstraint(
                 name="tv_status_valid",
-                condition=models.Q(tv_status__in=MediaStatusChoices.values),
+                condition=models.Q(tv_status__in=TVStatusChoices.values),
             ),
             models.CheckConstraint(
                 name="season_status_valid",

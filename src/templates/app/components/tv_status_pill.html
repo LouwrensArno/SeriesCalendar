@@ -1,0 +1,11 @@
+{% load i18n %}
+{# A TV show's TMDB status as a small icon + word pill. The TMDB wording stays as the tooltip. #}
+{% if status == "Returning Series" %}
+  <span class="inline-flex items-center gap-1.5 rounded-full ps-2 pe-2.5 py-0.5 text-xs font-semibold ring-1 ring-inset bg-green-500/15 text-green-400 ring-green-500/30" title="{{ status }}">{% include "app/icons/radio.svg" with classes="w-3.5 h-3.5" %}{% trans "Airing" %}</span>
+{% elif status == "Ended" %}
+  <span class="inline-flex items-center gap-1.5 rounded-full ps-2 pe-2.5 py-0.5 text-xs font-semibold ring-1 ring-inset bg-gray-500/15 text-gray-400 ring-gray-500/30" title="{{ status }}">{% include "app/icons/flag.svg" with classes="w-3.5 h-3.5" %}{% trans "Ended" %}</span>
+{% elif status == "Canceled" %}
+  <span class="inline-flex items-center gap-1.5 rounded-full ps-2 pe-2.5 py-0.5 text-xs font-semibold ring-1 ring-inset bg-red-500/15 text-red-400 ring-red-500/30" title="{{ status }}">{% include "app/icons/ban.svg" with classes="w-3.5 h-3.5" %}{% trans "Canceled" %}</span>
+{% else %}
+  <span class="inline-flex items-center gap-1.5 rounded-full ps-2 pe-2.5 py-0.5 text-xs font-semibold ring-1 ring-inset bg-amber-500/15 text-amber-400 ring-amber-500/30" title="{{ status }}">{% include "app/icons/hourglass.svg" with classes="w-3.5 h-3.5" %}{% trans "Coming" %}</span>
+{% endif %}
