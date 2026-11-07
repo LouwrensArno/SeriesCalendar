@@ -1,0 +1,519 @@
+import io
+import json
+import tempfile
+from contextlib import redirect_stdout
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from unittest.mock import patch
+
+import requests
+from django.contrib.auth import get_user_model
+from django.core.management import CommandError, call_command
+from django.test import SimpleTestCase, TestCase, override_settings
+
+from app.management.commands import crawl_disneyplus_za as command
+from app.models import TV, Item, MediaTypes, Sources, Status
+from app.providers import disneyplus_crawl as crawl
+from app.providers import disneyplus_za as dp
+
+NOW = datetime(2026, 11, 7, 22, 0, tzinfo=UTC)
+
+
+def eid(n):
+    """A title id, in the shape Disney+ uses."""
+    return f"entity-a{n:07d}"
+
+
+def title_page(name, *, seasons=None, year=2018, related=(), region="za"):
+    """A title's own page, as the real one renders it."""
+    tiles = "".join(
+        f'<a aria-label="{t}" href="/en-za/browse/{e}" rel="noreferrer">x</a>' for e, t in related
+    )
+    series = f"<span>• {seasons} Seasons</span>" if seasons else ""
+    return (
+        f"<html><head><title>Watch {name} | Full episodes | Disney+</title></head><body>"
+        f'<script id="__NEXT_DATA__">{{"pageProps":{{"region":"{region}"}}}}</script>'
+        f'{series}<script>{{"releaseYear":"{year}"}}</script>{tiles}</body></html>'
+    )
+
+
+class FakeResponse:
+    def __init__(self, status=200, text="", headers=None):
+        self.status_code, self.text, self.headers = status, text, headers or {}
+
+
+class FakeSite:
+    """Serves title pages by id, records every request, and can be made to misbehave."""
+
+    def __init__(self, pages):
+        self.pages = pages  # id -> html | int status | (status, headers) | Exception
+        self.requests = []
+
+    def get(self, url, headers=None, timeout=None, allow_redirects=True):
+        entity = url.rsplit("/", 1)[-1]
+        self.requests.append((entity, headers))
+        page = self.pages.get(entity, 404)
+        if isinstance(page, Exception):
+            raise page
+        if isinstance(page, tuple):
+            return FakeResponse(page[0], "", page[1])
+        if isinstance(page, int):
+            return FakeResponse(page, "")
+        return FakeResponse(200, page)
+
+    def fetched(self):
+        return [e for e, _ in self.requests]
+
+
+def state_with(*titles, links=None):
+    """A crawl state with these (id number, name) titles queued."""
+    state = crawl.CrawlState()
+    for n, name in titles:
+        state.add_seen(eid(n), name, "catalogue", NOW)
+        if links:
+            state.titles[eid(n)]["links"] = links.get(n, 1)
+    return state
+
+
+def run(state, site, **kwargs):
+    sleeps = []
+    summary = crawl.run_slice(
+        state, session=site, sleep=sleeps.append, now=kwargs.pop("now", NOW),
+        jitter=lambda lo, hi: (lo + hi) / 2, **kwargs,
+    )
+    return summary, sleeps
+
+
+class CrawlStateTests(SimpleTestCase):
+    def test_a_new_title_is_queued_once_and_a_repeat_counts_as_a_link(self):
+        state = crawl.CrawlState()
+
+        self.assertTrue(state.add_seen(eid(1), "Bluey", "related:x", NOW))
+        self.assertFalse(state.add_seen(eid(1), "Bluey", "related:y", NOW))
+        self.assertFalse(state.add_seen(eid(1), "Bluey", "related:z", NOW))
+
+        self.assertEqual(state.queue, [eid(1)])
+        self.assertEqual(state.titles[eid(1)]["links"], 3)
+        self.assertEqual(state.titles[eid(1)]["source"], "related:x")  # where it was first seen
+
+    def test_seeding_from_the_hub_catalogue_uses_ids_not_addresses(self):
+        state = crawl.CrawlState()
+        snapshot = {"titles": [{"entity": f"/en-za/browse/{eid(1)}", "title": "A", "collections": []},
+                               {"entity": f"/en-za/browse/{eid(2)}", "title": "B", "collections": []}]}
+
+        self.assertEqual(state.seed_from_catalogue(snapshot, NOW), 2)
+        self.assertEqual(state.seed_from_catalogue(snapshot, NOW), 0)  # nothing new the second time
+        self.assertEqual(state.queue, [eid(1), eid(2)])
+
+    def test_the_same_id_serves_every_region(self):
+        self.assertEqual(crawl.entity_id("/en-gb/browse/entity-abc"), "entity-abc")
+        self.assertEqual(crawl.entity_path("entity-abc"), "/en-za/browse/entity-abc")
+
+    def test_save_and_load_round_trip_without_a_temp_file_left(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "db" / "crawl.json"
+            state = state_with((1, "Shōgun"))
+
+            state.save(path)
+
+            self.assertEqual(crawl.CrawlState.load(path).data, state.data)
+            self.assertEqual([p.name for p in path.parent.iterdir()], ["crawl.json"])
+
+    def test_a_missing_damaged_or_old_file_starts_a_fresh_crawl(self):
+        with tempfile.TemporaryDirectory() as folder:
+            for text in (None, "{not json", json.dumps({"version": 0, "titles": {"x": 1}})):
+                path = Path(folder) / "c.json"
+                path.unlink(missing_ok=True)
+                if text:
+                    path.write_text(text)
+                state = crawl.CrawlState.load(path)
+                self.assertEqual((state.titles, state.queue), ({}, []))
+
+    def test_titles_you_track_are_read_first_then_the_most_linked_then_the_oldest(self):
+        state = state_with((1, "Old one"), (2, "Popular"), (3, "Bluey"), (4, "Another"), links={2: 5, 4: 2})
+
+        order = []
+        while (entity := state.next_entity({dp.normalize_title("Bluey")})):
+            order.append(entity)
+
+        self.assertEqual(order, [eid(3), eid(2), eid(4), eid(1)])
+
+    def test_an_empty_queue_gives_nothing(self):
+        self.assertIsNone(crawl.CrawlState().next_entity(frozenset()))
+
+    def test_counts(self):
+        state = state_with((1, "A"), (2, "B"))
+        state.titles[eid(1)]["status"] = "ok"
+        state.queue.remove(eid(1))
+
+        self.assertEqual(state.counts(), {"titles": 2, "queued": 1, "ok": 1})
+
+
+class RunSliceTests(SimpleTestCase):
+    def pages(self, n):
+        return {eid(i): title_page(f"Show {i}", seasons=2, year=2000 + i) for i in range(1, n + 1)}
+
+    def test_reads_up_to_the_budget_and_leaves_the_rest_queued(self):
+        state = state_with(*[(i, f"Show {i}") for i in range(1, 6)])
+        site = FakeSite(self.pages(5))
+
+        summary, _ = run(state, site, pages=3)
+
+        self.assertEqual((summary["pages"], summary["ended"]), (3, "budget"))
+        self.assertEqual(len(site.requests), 3)
+        self.assertEqual(len(state.queue), 2)
+
+    def test_records_what_a_page_says(self):
+        state = state_with((1, "Show 1"), (2, "Film"))
+        site = FakeSite({eid(1): title_page("Show 1", seasons=7, year=2012), eid(2): title_page("Film", year=1993)})
+
+        run(state, site)
+
+        show, film = state.titles[eid(1)], state.titles[eid(2)]
+        self.assertEqual((show["status"], show["year"], show["seasons"]), ("ok", 2012, 7))
+        self.assertEqual((film["status"], film["year"], film["seasons"]), ("ok", 1993, None))
+        self.assertEqual(show["page_title"], "Watch Show 1 | Full episodes")
+        self.assertEqual(show["checked_at"], "2026-11-07T22:00:00+00:00")
+
+    def test_related_titles_join_the_queue_and_count_their_links(self):
+        state = state_with((1, "Show 1"), (2, "Show 2"))
+        site = FakeSite({
+            eid(1): title_page("Show 1", related=[(eid(3), "New"), (eid(2), "Show 2")]),
+            eid(2): title_page("Show 2", related=[(eid(3), "New")]),
+            eid(3): title_page("New"),
+        })
+
+        summary, _ = run(state, site, pages=2)
+
+        self.assertEqual(summary["new_titles"], 1)
+        self.assertEqual(state.titles[eid(3)]["links"], 2)  # linked from both pages
+        self.assertEqual(state.titles[eid(3)]["source"], f"related:{eid(1)}")
+        self.assertEqual(state.queue, [eid(3)])
+        self.assertEqual(state.titles[eid(2)]["links"], 2)  # already known: counted, not re-queued
+
+    def test_waits_between_requests_but_not_before_the_first(self):
+        state = state_with(*[(i, f"S{i}") for i in range(1, 4)])
+
+        _, sleeps = run(state, FakeSite(self.pages(3)), delay=(4.0, 6.0))
+
+        self.assertEqual(sleeps, [5.0, 5.0])
+
+    def test_picks_its_pauses_from_the_range_it_is_given(self):
+        state = state_with(*[(i, f"S{i}") for i in range(1, 4)])
+        asked = []
+        crawl.run_slice(state, session=FakeSite(self.pages(3)), sleep=lambda s: None, now=NOW,
+                        jitter=lambda lo, hi: asked.append((lo, hi)) or lo, delay=(4.0, 6.0))
+
+        self.assertEqual(asked, [(4.0, 6.0), (4.0, 6.0)])
+
+    def test_a_title_is_read_once_and_the_crawl_resumes_where_it_stopped(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "crawl.json"
+            state = state_with(*[(i, f"Show {i}") for i in range(1, 7)])
+            site = FakeSite(self.pages(6))
+            run(state, site, pages=2, save=lambda s: s.save(path))
+
+            resumed = crawl.CrawlState.load(path)  # a later night, a fresh process
+            run(resumed, site, pages=10, save=lambda s: s.save(path))
+
+            self.assertEqual(sorted(site.fetched()), sorted(eid(i) for i in range(1, 7)))
+            self.assertEqual(len(site.fetched()), 6)  # none twice
+            self.assertEqual(crawl.CrawlState.load(path).counts()["ok"], 6)
+
+    def test_an_empty_queue_ends_the_run(self):
+        summary, _ = run(state_with(), FakeSite({}))
+
+        self.assertEqual((summary["pages"], summary["ended"]), (0, "queue empty"))
+
+    def test_a_page_that_no_longer_exists_is_set_aside_and_the_crawl_carries_on(self):
+        state = state_with((1, "Gone"), (2, "Here"))
+        site = FakeSite({eid(1): 404, eid(2): title_page("Here")})
+
+        summary, _ = run(state, site)
+
+        self.assertEqual((summary["gone"], summary["pages"]), (1, 1))
+        self.assertEqual(state.titles[eid(1)]["status"], "gone")
+        self.assertEqual(state.queue, [])  # not tried again
+
+    def test_410_counts_as_gone_too(self):
+        state = state_with((1, "Gone"))
+
+        run(state, FakeSite({eid(1): 410}))
+
+        self.assertEqual(state.titles[eid(1)]["status"], "gone")
+
+    def test_a_429_stops_at_once_and_pauses_for_as_long_as_the_site_asks(self):
+        state = state_with((1, "A"), (2, "B"), (3, "C"))
+        site = FakeSite({eid(1): title_page("A"), eid(2): (429, {"Retry-After": "7200"}), eid(3): title_page("C")})
+
+        summary, _ = run(state, site)
+
+        self.assertEqual(summary["ended"], "429")
+        self.assertEqual(site.fetched(), [eid(1), eid(2)])  # never touched the third
+        self.assertIn(eid(2), state.queue)  # the title that was refused is still to do
+        self.assertEqual(state.paused_until(NOW), NOW + timedelta(hours=2))
+
+    def test_a_429_without_a_retry_after_pauses_for_an_hour_and_a_huge_one_is_capped(self):
+        for header, expected in (({}, timedelta(hours=1)), ({"Retry-After": "999999"}, timedelta(hours=24)),
+                                 ({"Retry-After": "soon"}, timedelta(hours=1)), ({"Retry-After": "5"}, timedelta(minutes=1))):
+            state = state_with((1, "A"))
+            run(state, FakeSite({eid(1): (429, header)}))
+            self.assertEqual(state.paused_until(NOW), NOW + expected, header)
+
+    def test_while_paused_nothing_is_requested_and_it_resumes_afterwards(self):
+        state = state_with((1, "A"), (2, "B"))
+        run(state, FakeSite({eid(1): (429, {"Retry-After": "3600"})}))
+
+        site = FakeSite({eid(1): title_page("A"), eid(2): title_page("B")})
+        during, _ = run(state, site, now=NOW + timedelta(minutes=30))
+        after, _ = run(state, site, now=NOW + timedelta(hours=1, minutes=1))
+
+        self.assertEqual((during["ended"], during["pages"], site.fetched()[:0]), ("paused", 0, []))
+        self.assertEqual((after["pages"], after["ended"]), (2, "queue empty"))
+        self.assertEqual(len(site.fetched()), 2)
+
+    def test_a_403_means_blocked_and_pauses_for_a_day(self):
+        state = state_with((1, "A"), (2, "B"))
+
+        summary, _ = run(state, FakeSite({eid(1): 403}))
+
+        self.assertEqual(summary["ended"], "403")
+        self.assertEqual(state.paused_until(NOW), NOW + timedelta(hours=24))
+
+    def test_three_failures_in_a_row_stop_the_run_and_pause_it(self):
+        state = state_with(*[(i, f"S{i}") for i in range(1, 6)])
+        site = FakeSite({eid(i): 503 for i in range(1, 6)})
+
+        summary, _ = run(state, site)
+
+        self.assertEqual((summary["ended"], summary["failed"]), ("errors", 3))
+        self.assertEqual(len(site.requests), 3)
+        self.assertEqual(state.paused_until(NOW), NOW + timedelta(hours=6))
+
+    def test_a_success_in_between_resets_the_count_of_failures(self):
+        pages = {eid(1): 500, eid(2): 500, eid(3): title_page("C"), eid(4): 500, eid(5): 500, eid(6): title_page("F")}
+        state = state_with(*[(i, f"S{i}") for i in range(1, 7)])
+
+        summary, _ = run(state, FakeSite(pages), pages=20)
+
+        self.assertNotEqual(summary["ended"], "errors")
+        self.assertIsNone(state.paused_until(NOW))
+
+    def test_a_network_error_counts_as_a_failure(self):
+        state = state_with((1, "A"))
+
+        summary, _ = run(state, FakeSite({eid(1): requests.ConnectionError("reset")}))
+
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(state.titles[eid(1)]["errors"], 1)
+        self.assertEqual(state.queue, [eid(1)])  # will be tried again
+
+    def test_a_title_that_keeps_failing_is_set_aside(self):
+        state = state_with((1, "Broken"))
+        site = FakeSite({eid(1): 500})
+
+        for night in range(3):
+            run(state, site, now=NOW + timedelta(days=night))
+
+        self.assertEqual(state.titles[eid(1)]["status"], "error")
+        self.assertEqual(state.queue, [])
+
+    def test_the_wrong_region_aborts_without_recording_or_losing_the_title(self):
+        state = state_with((1, "A"), (2, "B"))
+        site = FakeSite({eid(1): title_page("A", region="us")})
+        saved = []
+
+        with self.assertRaisesRegex(dp.CatalogueError, "region 'us'"):
+            run(state, site, save=lambda s: saved.append(dict(s.data)))
+
+        self.assertEqual(state.titles[eid(1)]["status"], "queued")
+        self.assertIn(eid(1), state.queue)
+        self.assertEqual(len(site.requests), 1)  # it did not carry on
+        self.assertTrue(saved)  # the progress so far was still saved
+
+    def test_progress_is_saved_every_so_often_and_at_the_end(self):
+        n = crawl.SAVE_EVERY * 2 + 3
+        state = state_with(*[(i, f"S{i}") for i in range(1, n + 1)])
+        saves = []
+
+        run(state, FakeSite(self.pages(n)), pages=n, save=lambda s: saves.append(s.counts()["ok"]))
+
+        self.assertEqual(saves, [crawl.SAVE_EVERY, crawl.SAVE_EVERY * 2, n])
+
+    def test_progress_is_saved_even_when_something_goes_wrong_part_way(self):
+        state = state_with(*[(i, f"S{i}") for i in range(1, 4)])
+        saves = []
+
+        class Exploding(FakeSite):
+            def get(self, url, **kwargs):
+                if url.endswith(eid(3)):
+                    raise KeyboardInterrupt
+                return super().get(url, **kwargs)
+
+        with self.assertRaises(KeyboardInterrupt):
+            run(state, Exploding(self.pages(3)), save=lambda s: saves.append(s.counts()["ok"]))
+
+        self.assertEqual(saves[-1], 2)  # the two pages already read were kept
+
+    def test_only_the_last_runs_are_kept_in_the_history(self):
+        state = crawl.CrawlState()
+        for night in range(crawl.KEEP_RUNS + 5):
+            run(state, FakeSite({}), now=NOW + timedelta(days=night))
+
+        self.assertEqual(len(state.data["runs"]), crawl.KEEP_RUNS)
+        self.assertEqual(state.data["runs"][-1]["ended"], "queue empty")
+
+    def test_requests_carry_the_honest_user_agent_and_no_login(self):
+        state = state_with((1, "A"))
+        site = FakeSite(self.pages(1))
+
+        run(state, site)
+
+        headers = site.requests[0][1]
+        self.assertIn("Yamtrack", headers["User-Agent"])
+        self.assertNotIn("Cookie", headers)
+        self.assertNotIn("Authorization", headers)
+
+
+class CrawlLockTests(SimpleTestCase):
+    def test_the_lock_exists_while_running_and_is_removed_after(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "c.lock"
+            with crawl.crawl_lock(path, NOW):
+                self.assertTrue(path.exists())
+            self.assertFalse(path.exists())
+
+    def test_a_second_run_is_refused(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "c.lock"
+            with crawl.crawl_lock(path, datetime.now(UTC)), self.assertRaises(crawl.CrawlLocked), \
+                 crawl.crawl_lock(path, datetime.now(UTC)):
+                pass
+            self.assertFalse(path.exists())  # the first run's cleanup still happened
+
+    def test_the_lock_is_released_when_the_run_fails(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "c.lock"
+            with self.assertRaises(RuntimeError), crawl.crawl_lock(path, NOW):
+                raise RuntimeError("boom")
+            self.assertFalse(path.exists())
+
+    def test_a_lock_left_by_a_crashed_run_is_replaced_after_a_few_hours(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "c.lock"
+            path.write_text("123")
+            later = datetime.fromtimestamp(path.stat().st_mtime, UTC) + crawl.LOCK_STALE_AFTER + timedelta(minutes=1)
+
+            with crawl.crawl_lock(path, later):
+                self.assertTrue(path.exists())
+
+            fresh = datetime.fromtimestamp(path.stat().st_mtime, UTC) if path.exists() else None
+            self.assertIsNone(fresh)
+
+
+class CrawlCommandTests(TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.state_file = Path(self.folder.name) / "crawl.json"
+        self.catalogue = Path(self.folder.name) / "catalogue.json"
+        dp.save_snapshot({"titles": [{"entity": f"/en-za/browse/{eid(i)}", "title": f"T{i}", "collections": []}
+                                     for i in range(1, 4)]}, self.catalogue)
+        patcher = patch.object(command, "catalogue_path", return_value=self.catalogue)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def call(self, *args):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            call_command("crawl_disneyplus_za", *args, "--state", str(self.state_file), stdout=out)
+        return out.getvalue()
+
+    def fake_slice(self, **fixed):
+        summary = {"pages": 2, "new_titles": 1, "gone": 0, "failed": 0, "ended": "budget", **fixed}
+        return patch.object(crawl, "run_slice", return_value=summary)
+
+    def test_it_is_off_unless_switched_on(self):
+        with override_settings(DISNEYPLUS_CRAWL=False), self.fake_slice() as read, \
+             self.assertRaisesRegex(CommandError, "switched off"):
+            self.call()
+
+        read.assert_not_called()
+        self.assertFalse(self.state_file.exists())
+
+    def test_it_is_off_by_default(self):
+        from django.conf import settings  # noqa: PLC0415
+
+        self.assertFalse(settings.DISNEYPLUS_CRAWL)
+
+    def test_status_works_when_switched_off_and_never_touches_the_site(self):
+        with override_settings(DISNEYPLUS_CRAWL=False), self.fake_slice() as read:
+            output = self.call("--status")
+
+        read.assert_not_called()
+        self.assertIn("Crawl state: 0 queued, 0 titles", output)
+
+    def test_the_first_run_seeds_the_queue_from_the_hub_catalogue_and_saves_progress(self):
+        with override_settings(DISNEYPLUS_CRAWL=True), self.fake_slice() as read:
+            output = self.call()
+
+        self.assertIn("Started a new crawl with 3 titles", output)
+        self.assertIn("Read 2 pages (1 new titles", output)
+        self.assertEqual(len(crawl.CrawlState.load(self.state_file).titles), 3)
+        self.assertEqual(read.call_args.kwargs["pages"], crawl.DEFAULT_PAGES)
+        self.assertEqual(read.call_args.kwargs["delay"], crawl.DEFAULT_DELAY)
+
+    def test_a_later_run_carries_on_without_seeding_again(self):
+        with override_settings(DISNEYPLUS_CRAWL=True), self.fake_slice():
+            self.call()
+            output = self.call()
+
+        self.assertNotIn("Started a new crawl", output)
+
+    def test_titles_you_track_are_passed_so_they_are_read_first(self):
+        user = get_user_model().objects.create_user(username="u")
+        item = Item.objects.create(media_id="1", source=Sources.TMDB.value, media_type=MediaTypes.TV.value,
+                                   title="Bluey", image="http://x/i.jpg")
+        TV.objects.create(item=item, user=user, status=Status.PLANNING.value)
+
+        with override_settings(DISNEYPLUS_CRAWL=True), self.fake_slice() as read:
+            self.call("--pages", "50", "--delay-min", "3", "--delay-max", "4")
+
+        self.assertEqual(read.call_args.kwargs["wanted"], {"bluey"})
+        self.assertEqual((read.call_args.kwargs["pages"], read.call_args.kwargs["delay"]), (50, (3.0, 4.0)))
+
+    def test_a_pause_is_reported(self):
+        with override_settings(DISNEYPLUS_CRAWL=True), self.fake_slice(ended="429", paused_until="2026-11-08T00:00:00+00:00"):
+            output = self.call()
+
+        self.assertIn("Stopped: 429", output)
+        self.assertIn("Paused until 2026-11-08", output)
+
+    def test_unkind_delays_are_refused(self):
+        with override_settings(DISNEYPLUS_CRAWL=True), self.fake_slice() as read:
+            for args in (("--delay-min", "0.2"), ("--delay-min", "5", "--delay-max", "3")):
+                with self.assertRaisesRegex(CommandError, "delay"):
+                    self.call(*args)
+
+        read.assert_not_called()
+
+    def test_a_crawl_already_running_is_refused(self):
+        lock = Path(f"{self.state_file}.lock")
+        lock.write_text("1")
+
+        with override_settings(DISNEYPLUS_CRAWL=True), self.fake_slice() as read, \
+             self.assertRaisesRegex(CommandError, "Another crawl is running"):
+            self.call()
+
+        read.assert_not_called()
+
+    def test_a_wrong_region_is_a_clear_error_and_the_progress_is_kept(self):
+        def boom(state, **kwargs):
+            state.titles[eid(1)]["status"] = "ok"
+            raise dp.CatalogueError("Disney+ answered for region 'us', not 'za'")
+
+        with override_settings(DISNEYPLUS_CRAWL=True), patch.object(crawl, "run_slice", side_effect=boom), \
+             self.assertRaisesRegex(CommandError, "region 'us'"):
+            self.call()
+
+        self.assertEqual(crawl.CrawlState.load(self.state_file).titles[eid(1)]["status"], "ok")

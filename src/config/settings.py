@@ -385,6 +385,8 @@ TMDB_API = config(
     ),
 )
 TMDB_NSFW = config("TMDB_NSFW", default=False, cast=bool)
+# Off unless switched on: the slow crawl of Disney+ South Africa's public title pages
+DISNEYPLUS_CRAWL = config("DISNEYPLUS_CRAWL", default=False, cast=bool)
 TMDB_LANG = config("TMDB_LANG", default="en")
 
 TVDB_API = config(
