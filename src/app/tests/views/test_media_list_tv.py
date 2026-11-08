@@ -13,6 +13,7 @@ from app.models import (
     Status,
     TVShowDetails,
 )
+from users.models import TVSortChoices, TVStatusChoices
 
 
 class TVListViewTests(TestCase):
@@ -183,3 +184,13 @@ class TVListViewTests(TestCase):
         get_metadata.assert_called_once_with(MediaTypes.TV.value, "75219", "tmdb")
         self.assertContains(response, "Apple TV")
         self.assertTrue(TVShowDetails.objects.filter(item=item).exists())
+
+    def test_choosing_a_filter_or_sort_sends_the_chosen_value_itself(self):
+        """The hidden form is updated by Alpine only after the click, so reading it would send the previous
+        filter and the first rows would not match the pages loaded after them (duplicated shows)."""
+        response = self.client.get(self.url, {"layout": "table"})
+
+        for value, _ in TVStatusChoices.choices:
+            self.assertContains(response, f"hx-vals='{{\"status\": \"{value}\"}}'")
+        for value, _ in TVSortChoices.choices:
+            self.assertContains(response, f"hx-vals='{{\"sort\": \"{value}\"}}'")

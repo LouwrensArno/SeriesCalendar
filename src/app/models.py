@@ -332,6 +332,91 @@ class TVShowDetails(models.Model):
         return f"{self.item} ({self.status or 'unknown'})"
 
 
+class MovieDetailsManager(models.Manager):
+    """Keeps MovieDetails in step with TMDB."""
+
+    def refresh(self, items, *, max_age=timedelta(days=1), force=False):
+        """Fetch TMDB's current details for the movies whose stored details need it.
+
+        A movie needs it when it has no details yet, or they are older than `max_age`.
+        A movie TMDB can't be reached for keeps whatever it had, so one failure never
+        stops the rest. Returns how many movies were refreshed.
+        """
+        movie_items = [
+            item
+            for item in items
+            if item.media_type == MediaTypes.MOVIE.value
+            and item.source == Sources.TMDB.value
+        ]
+        existing = {d.item_id: d for d in self.filter(item__in=movie_items)}
+        cutoff = timezone.now() - max_age
+        refreshed = 0
+
+        for item in movie_items:
+            current = existing.get(item.id)
+            if not (
+                force
+                or current is None
+                or current.providers is None
+                or current.refreshed_at < cutoff
+            ):
+                continue
+
+            try:
+                metadata = providers.services.get_media_metadata(
+                    MediaTypes.MOVIE.value,
+                    item.media_id,
+                    item.source,
+                )
+            except (providers.services.ProviderAPIError, requests.RequestException):
+                logger.warning("Could not load movie details for %s", item)
+                continue
+
+            release_date = metadata.get("details", {}).get("release_date")
+            self.update_or_create(
+                item=item,
+                defaults={
+                    "release_date": parse_date(release_date) if release_date else None,
+                    "providers": providers.tmdb.get_streaming_providers(
+                        metadata.get("providers"),
+                    ),
+                    "refreshed_at": timezone.now(),
+                },
+            )
+            refreshed += 1
+
+        return refreshed
+
+
+class MovieDetails(models.Model):
+    """TMDB's current details for a movie, kept so the movie list can show them.
+
+    Filled in as movies are viewed, and refreshed daily by the "Refresh movie
+    details" task.
+    """
+
+    item = models.OneToOneField(
+        Item,
+        on_delete=models.CASCADE,
+        related_name="movie_details",
+    )
+    release_date = models.DateField(null=True, blank=True)
+    # Where to watch, per region: same shape as TVShowDetails.providers.
+    providers = models.JSONField(null=True, blank=True, default=None)
+    refreshed_at = models.DateTimeField(default=timezone.now)
+
+    objects = MovieDetailsManager()
+
+    class Meta:
+        """Meta options for the model."""
+
+        verbose_name_plural = "movie details"
+
+    def __str__(self):
+        """Return the name of the movie the details belong to."""
+        return f"{self.item} ({self.release_date.year if self.release_date else 'unknown'})"
+
+
 class MediaManager(models.Manager):
     """Custom manager for media models."""
 
@@ -385,6 +470,8 @@ class MediaManager(models.Manager):
         queryset = queryset.select_related("item")
         if media_type == MediaTypes.TV.value:
             queryset = queryset.select_related("item__show_details")
+        elif media_type == MediaTypes.MOVIE.value:
+            queryset = queryset.select_related("item__movie_details")
         queryset = self._apply_prefetch_related(queryset, media_type)
 
         if sort_filter:

@@ -614,6 +614,10 @@ CELERY_BEAT_SCHEDULE = {
         "task": "Refresh TV show details",
         "schedule": 60 * 60 * 24,  # every 24 hours
     },
+    "refresh_movie_details": {
+        "task": "Refresh movie details",
+        "schedule": 60 * 60 * 24,  # every 24 hours
+    },
     # does nothing unless the Disney+ crawl is switched on
     "crawl_disneyplus_za": {
         "task": "Crawl Disney+ South Africa",

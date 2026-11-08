@@ -1,0 +1,25 @@
+{% load app_tags %}
+{% load i18n %}
+{# Free and subscription services streaming a title in the user's region; `details` holds the stored TMDB providers #}
+<td class="p-2 text-center">
+  {% show_watch_providers details target_user as streaming %}
+  {% if streaming %}
+    <div class="flex items-center justify-center gap-1">
+      {% for provider in streaming|slice:":3" %}
+        <img class="w-6 h-6 rounded-md"
+             src="{{ provider.image }}"
+             alt="{{ provider.provider_name }}"
+             title="{{ provider.provider_name }}"
+             loading="lazy">
+      {% endfor %}
+      {% if streaming|length > 3 %}
+        <span class="text-xs text-gray-400"
+              title="{% for provider in streaming|slice:"3:" %}{{ provider.provider_name }}{% if not forloop.last %}, {% endif %}{% endfor %}">+{{ streaming|length|add:"-3" }}</span>
+      {% endif %}
+    </div>
+  {% elif target_user.watch_provider_region == "UNSET" and request.user == target_user %}
+    <span class="text-gray-500" title="{% trans "Set a watch provider region in your preferences to see where to watch" %}">-</span>
+  {% else %}
+    <span class="text-gray-500">-</span>
+  {% endif %}
+</td>

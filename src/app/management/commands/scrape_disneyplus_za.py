@@ -3,7 +3,7 @@ from django.core.cache import cache
 from django.core.management.base import BaseCommand, CommandError
 from django.db.models import Q
 
-from app.models import Item, MediaTypes, Sources, TVShowDetails
+from app.models import Item, MediaTypes, MovieDetails, Sources, TVShowDetails
 from app.providers import disneyplus_crawl, disneyplus_za, services
 
 
@@ -36,20 +36,22 @@ def refresh_changed(old, new):
 
     TMDB data is cached for hours and already holds the old provider list, so the cached
     entries of every title whose match was added, removed or changed are cleared and the
-    stored show details of the shows among them are fetched again.
+    stored details of the shows and movies among them are fetched again.
     """
     changed = [
         key
         for key in set(old) | set(new)
         if (old.get(key) or {}).get("entity") != (new.get(key) or {}).get("entity")
     ]
-    show_ids = []
+    show_ids, movie_ids = [], []
     for key in changed:
         kind, media_id = key.split(":", 1)
         cache.delete(f"{Sources.TMDB.value}_{kind}_{media_id}")
         if kind == MediaTypes.TV.value:
             show_ids.append(media_id)
             cache.delete_pattern(f"{Sources.TMDB.value}_{MediaTypes.SEASON.value}_{media_id}_*")
+        elif kind == MediaTypes.MOVIE.value:
+            movie_ids.append(media_id)
     if show_ids:
         shows = Item.objects.filter(
             source=Sources.TMDB.value,
@@ -57,6 +59,13 @@ def refresh_changed(old, new):
             media_id__in=show_ids,
         )
         TVShowDetails.objects.refresh(shows, force=True)
+    if movie_ids:
+        movies = Item.objects.filter(
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            media_id__in=movie_ids,
+        )
+        MovieDetails.objects.refresh(movies, force=True)
     return changed
 
 

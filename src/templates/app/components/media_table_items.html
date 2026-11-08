@@ -51,29 +51,7 @@
           <span class="text-gray-500">-</span>
         {% endif %}
       </td>
-      <td class="p-2 text-center">
-        {# Free and subscription services streaming the show in the user's region #}
-        {% show_watch_providers media.item.show_details target_user as streaming %}
-        {% if streaming %}
-          <div class="flex items-center justify-center gap-1">
-            {% for provider in streaming|slice:":3" %}
-              <img class="w-6 h-6 rounded-md"
-                   src="{{ provider.image }}"
-                   alt="{{ provider.provider_name }}"
-                   title="{{ provider.provider_name }}"
-                   loading="lazy">
-            {% endfor %}
-            {% if streaming|length > 3 %}
-              <span class="text-xs text-gray-400"
-                    title="{% for provider in streaming|slice:"3:" %}{{ provider.provider_name }}{% if not forloop.last %}, {% endif %}{% endfor %}">+{{ streaming|length|add:"-3" }}</span>
-            {% endif %}
-          </div>
-        {% elif target_user.watch_provider_region == "UNSET" and request.user == target_user %}
-          <span class="text-gray-500" title="{% trans "Set a watch provider region in your preferences to see where to watch" %}">-</span>
-        {% else %}
-          <span class="text-gray-500">-</span>
-        {% endif %}
-      </td>
+      {% include "app/components/watch_providers_cell.html" with details=media.item.show_details %}
       <td class="p-2 text-center">
         {% if media.item.show_details.status %}
           {% include "app/components/tv_status_pill.html" with status=media.item.show_details.status %}
@@ -109,6 +87,17 @@
         </div>
       </td>
     {% else %}
+      {% if media_type == MediaTypes.MOVIE.value %}
+        {# Movies: TMDB's release year and where to watch, then your own tracking #}
+        <td class="p-2 text-center">
+          {% if media.item.movie_details.release_date %}
+            {{ media.item.movie_details.release_date.year }}
+          {% else %}
+            <span class="text-gray-500">-</span>
+          {% endif %}
+        </td>
+        {% include "app/components/watch_providers_cell.html" with details=media.item.movie_details %}
+      {% endif %}
       {% if media.score is not None %}
         <td class="p-2 text-center">
           <div class="flex items-center justify-center">

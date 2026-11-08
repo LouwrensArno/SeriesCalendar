@@ -27,6 +27,7 @@ from app.models import (
     Episode,
     Item,
     MediaTypes,
+    MovieDetails,
     Season,
     Sources,
     Status,
@@ -253,6 +254,12 @@ def media_list(request, username, media_type):
         if TVShowDetails.objects.refresh(items):
             for item in items:
                 item._state.fields_cache.pop("show_details", None)  # noqa: SLF001
+    elif media_type == MediaTypes.MOVIE.value:
+        # Same for the movies on this page: release year and where to watch.
+        items = [movie.item for movie in media_page.object_list]
+        if MovieDetails.objects.refresh(items):
+            for item in items:
+                item._state.fields_cache.pop("movie_details", None)  # noqa: SLF001
 
     context = {
         "media_type": media_type,

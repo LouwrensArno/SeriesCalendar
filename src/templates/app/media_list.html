@@ -57,12 +57,14 @@
                x-transition:leave-start="transform opacity-100 scale-100"
                x-transition:leave-end="transform opacity-0 scale-95">
             {% for value, label in status_choices %}
+              {# hx-vals carries the chosen value itself: the hidden form input is only updated by Alpine after this click, so reading it here would send the previous filter #}
               <button hx-get="{% url 'medialist' target_user.username media_type %}"
                       {% if media_list %} hx-target="{{ layout_class }}" {% else %} hx-target="#empty_list" {% endif %}
                       hx-include="#filter-form"
+                      hx-vals='{"status": "{{ value }}"}'
                       hx-indicator="#loading-indicator"
                       class="block w-full px-4 py-2 text-left text-sm transition-colors cursor-pointer"
-                      :class="status === '{{ value }}' ? 'bg-indigo-600 text-white font-medium' : 'text-gray-300 hover:bg-[#454d5a] hover:text-white'"
+                      :class="status === '{{ value }}' ?'bg-indigo-600 text-white font-medium' : 'text-gray-300 hover:bg-[#454d5a] hover:text-white'"
                       @click="status = '{{ value }}'; open = false"
                       type="button">{{ label }}</button>
             {% endfor %}
@@ -93,9 +95,10 @@
               <button hx-get="{% url 'medialist' target_user.username media_type %}"
                       {% if media_list %} hx-target="{{ layout_class }}" {% else %} hx-target="#empty_list" {% endif %}
                       hx-include="#filter-form"
+                      hx-vals='{"sort": "{{ value }}"}'
                       hx-indicator="#loading-indicator"
                       class="block w-full px-4 py-2 text-left text-sm transition-colors cursor-pointer"
-                      :class="sort === '{{ value }}' ? 'bg-indigo-600 text-white font-medium' : 'text-gray-300 hover:bg-[#454d5a] hover:text-white'"
+                      :class="sort === '{{ value }}' ?'bg-indigo-600 text-white font-medium' : 'text-gray-300 hover:bg-[#454d5a] hover:text-white'"
                       @click="sort = '{{ value }}'; open = false"
                       type="button">{{ label }}</button>
             {% endfor %}
@@ -157,6 +160,10 @@
                 <th class="p-2 text-center whitespace-nowrap">{% trans "Seasons" %}</th>
                 <th class="p-2 text-center w-40 whitespace-nowrap">{% trans "Episodes" %}</th>
               {% else %}
+                {% if media_type == MediaTypes.MOVIE.value %}
+                  <th class="p-2 text-center whitespace-nowrap">{% trans "Year" %}</th>
+                  <th class="p-2 text-center whitespace-nowrap">{% trans "Where to Watch" %}</th>
+                {% endif %}
                 <th class="p-2 text-center">{% trans "Score" %}</th>
                 {% if media_type != MediaTypes.MOVIE.value %}
                   <th class="p-2 text-center">{% trans "Progress" %}</th>

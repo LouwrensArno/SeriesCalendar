@@ -1,3 +1,6 @@
+import os
+import subprocess
+import sys
 import tempfile
 from datetime import timedelta
 from pathlib import Path
@@ -89,3 +92,24 @@ class CrawlDisneyplusTaskTests(SimpleTestCase):
 
         self.assertEqual(entry["task"], "Crawl Disney+ South Africa")
         self.assertEqual(entry["schedule"].hour, {settings.DISNEYPLUS_CRAWL_HOUR})
+
+
+class TaskImportsTests(SimpleTestCase):
+    """The refresh tasks need the TMDB provider modules, which the models only reach as attributes."""
+
+    def test_importing_the_tasks_alone_makes_the_providers_available(self):
+        code = (
+            "import django; django.setup(); import app.tasks; from app import providers; "
+            "print(hasattr(providers, 'services') and hasattr(providers, 'tmdb'))"
+        )
+
+        result = subprocess.run(  # noqa: S603
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            check=False,
+            cwd=settings.BASE_DIR,
+            env={**os.environ, "DJANGO_SETTINGS_MODULE": "config.settings"},
+        )
+
+        self.assertEqual(result.stdout.strip().splitlines()[-1], "True", result.stderr[-500:])

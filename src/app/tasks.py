@@ -7,8 +7,16 @@ from celery import shared_task
 from django.conf import settings
 from django.utils import timezone
 
-from app.models import Item, MediaTypes, Sources, TVShowDetails, UserMessage
+from app.models import (
+    Item,
+    MediaTypes,
+    MovieDetails,
+    Sources,
+    TVShowDetails,
+    UserMessage,
+)
 from app.providers import disneyplus_crawl as crawl
+from app.providers import services, tmdb  # noqa: F401  (the models reach them as app.providers.*)
 
 logger = logging.getLogger(__name__)
 
@@ -65,3 +73,18 @@ def crawl_disneyplus_za():
 def refresh_tv_show_details():
     """Refresh TMDB's details (status, networks, seasons, next air date) of every tracked show."""
     return TVShowDetails.objects.refresh(tracked_tv_items(), force=True)
+
+
+def tracked_movie_items():
+    """Return every TMDB movie item that at least one user tracks."""
+    return Item.objects.filter(
+        media_type=MediaTypes.MOVIE.value,
+        source=Sources.TMDB.value,
+        movie__isnull=False,
+    ).distinct()
+
+
+@shared_task(name="Refresh movie details")
+def refresh_movie_details():
+    """Refresh TMDB's details (release date, where to watch) of every tracked movie."""
+    return MovieDetails.objects.refresh(tracked_movie_items())
