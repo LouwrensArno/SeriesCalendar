@@ -40,6 +40,12 @@ TITLE_RE = re.compile(r"<title[^>]*>([^<]*)</title>")
 REGION_RE = re.compile(r'"region"\s*:\s*"([a-z]{2})"')
 YEAR_RE = re.compile(r'"(?:releaseYear|year)"\s*:\s*"?((?:19|20)\d{2})')
 SEASONS_RE = re.compile(r"(\d+)\s+Seasons?\b")
+# A title the service does not carry in your region still answers 200, with an empty page
+# ("hasContent": false) that has no title, no episodes and no related titles.
+HAS_CONTENT_RE = re.compile(r'"hasContent"\s*:\s*(true|false)')
+KIND_RE = re.compile(r'"@type"\s*:\s*"(?!BreadcrumbList|ListItem|WebPage)([A-Za-z]+)"')
+EPISODES_MARKER = '"_type":"Episodes"'
+TITLE_KINDS = {"TVSeries", "Movie"}  # anything else (a team, a collection...) is not a title
 
 # A snapshot that is much smaller than the last good one means the site changed, not
 # that the catalogue shrank: keep the old one.
@@ -74,15 +80,39 @@ def parse_page(page_html):
 
 
 def parse_entity(page_html):
-    """Return what a single title's page says about it: its year and season count."""
+    """Return what a single title's page says about it.
+
+    Its year and season count, whether the service really has it (`has_content`: None if the
+    page doesn't say), what kind of page it is (`kind`: "TVSeries", "Movie"...) and whether
+    it lists episodes.
+    """
     year = YEAR_RE.search(page_html)
     seasons = SEASONS_RE.search(page_html)
+    has_content = HAS_CONTENT_RE.search(page_html)
+    kind = KIND_RE.search(page_html)
     return {
         "year": int(year.group(1)) if year else None,
         "seasons": int(seasons.group(1)) if seasons else None,
+        "has_content": has_content.group(1) == "true" if has_content else None,
+        "kind": kind.group(1) if kind else None,
+        "has_episodes": EPISODES_MARKER in page_html,
         # the "more like this" tiles: other titles on the service, free to collect
         "related": parse_page(page_html)[1],
     }
+
+
+def is_playable(details):
+    """Can this title really be watched? Judged from what `parse_entity` returned.
+
+    An empty page (not carried in this region), a page that isn't a show or film, and a
+    series page without any episodes are not. Facts the page doesn't give don't count
+    against it, so details saved without them still pass.
+    """
+    if details.get("has_content") is False:
+        return False
+    if details.get("kind") not in (None, *TITLE_KINDS):
+        return False
+    return not (details.get("seasons") is not None and details.get("has_episodes") is False)
 
 
 def normalize_title(title):
@@ -242,8 +272,11 @@ def entity_matches(media_type, year, details):
     """Is the Disney+ page `details` describes the same kind of title, from the same year?
 
     A series' page says "N Seasons", a movie's doesn't. The year may be off by one.
-    A page that gives no year can't be checked on it, so it passes on type alone.
+    A page that gives no year can't be checked on it, so it passes on type alone. A page for
+    something that can't be watched here (see `is_playable`) never matches.
     """
+    if not is_playable(details):
+        return False
     is_series = details.get("seasons") is not None
     if is_series != (media_type == "tv"):
         return False

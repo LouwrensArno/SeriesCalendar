@@ -1,4 +1,6 @@
 import logging
+import subprocess
+import sys
 from datetime import timedelta
 
 from celery import shared_task
@@ -6,6 +8,7 @@ from django.conf import settings
 from django.utils import timezone
 
 from app.models import Item, MediaTypes, Sources, TVShowDetails, UserMessage
+from app.providers import disneyplus_crawl as crawl
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +34,31 @@ def cleanup_user_messages():
     logger.info("Deleted %s old shown user messages.", deleted_count)
 
     return deleted_count
+
+
+@shared_task(name="Crawl Disney+ South Africa")
+def crawl_disneyplus_za():
+    """Start tonight's slice of the Disney+ South Africa crawl, if it is switched on.
+
+    It runs in its own process: it takes over an hour and the worker does one task at a time,
+    so waiting for it here would hold up the release notifications. The command takes its own
+    lock, so a second start while one is running is refused and logged.
+    """
+    if not crawl.crawl_enabled():
+        return "off"
+    log_path = settings.BASE_DIR / "db" / "disneyplus_crawl.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("ab") as log:
+        log.write(f"\n--- {timezone.now().isoformat(timespec='seconds')} ---\n".encode())
+        log.flush()
+        subprocess.Popen(  # noqa: S603
+            [sys.executable, str(settings.BASE_DIR / "manage.py"), "crawl_disneyplus_za"],
+            cwd=settings.BASE_DIR,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    return "started"
 
 
 @shared_task(name="Refresh TV show details")

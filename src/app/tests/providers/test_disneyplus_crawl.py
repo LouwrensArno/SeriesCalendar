@@ -24,15 +24,24 @@ def eid(n):
     return f"entity-a{n:07d}"
 
 
-def title_page(name, *, seasons=None, year=2018, related=(), region="za"):
-    """A title's own page, as the real one renders it."""
+def title_page(name, *, seasons=None, year=2018, related=(), region="za", has_content=True, kind=None):
+    """A title's own page, as the real one renders it (has_content=False: not carried here)."""
     tiles = "".join(
         f'<a aria-label="{t}" href="/en-za/browse/{e}" rel="noreferrer">x</a>' for e, t in related
     )
     series = f"<span>• {seasons} Seasons</span>" if seasons else ""
+    kind = kind or ("TVSeries" if seasons else "Movie")
+    episodes = '{"_type":"Episodes"}' if seasons else "null"
+    if not has_content:
+        return (
+            "<html><head></head><body>"
+            f'<script id="__NEXT_DATA__">{{"pageProps":{{"hasContent":false,"region":"{region}"}}}}</script>'
+            "</body></html>"
+        )
     return (
         f"<html><head><title>Watch {name} | Full episodes | Disney+</title></head><body>"
-        f'<script id="__NEXT_DATA__">{{"pageProps":{{"region":"{region}"}}}}</script>'
+        f'<script id="__NEXT_DATA__">{{"pageProps":{{"hasContent":true,"region":"{region}",'
+        f'"ldJSON":{{"@graph":[{{"@type":"{kind}"}}]}},"episodes":{episodes}}}}}</script>'
         f'{series}<script>{{"releaseYear":"{year}"}}</script>{tiles}</body></html>'
     )
 
@@ -174,6 +183,45 @@ class RunSliceTests(SimpleTestCase):
         self.assertEqual((film["status"], film["year"], film["seasons"]), ("ok", 1993, None))
         self.assertEqual(show["page_title"], "Watch Show 1 | Full episodes")
         self.assertEqual(show["checked_at"], "2026-11-07T22:00:00+00:00")
+
+    def test_a_page_records_whether_it_can_really_be_watched(self):
+        state = state_with((1, "Show"), (2, "Film"), (3, "Team"), (4, "Elsewhere"))
+        site = FakeSite({
+            eid(1): title_page("Show", seasons=2),
+            eid(2): title_page("Film"),
+            eid(3): title_page("Team", kind="ItemList"),
+            eid(4): title_page("Elsewhere", has_content=False),
+        })
+
+        summary, _ = run(state, site)
+
+        self.assertEqual([state.titles[eid(i)]["playable"] for i in range(1, 5)], [True, True, False, False])
+        self.assertEqual(state.titles[eid(3)]["kind"], "ItemList")
+        self.assertEqual((summary["pages"], summary["unplayable"]), (4, 2))
+        self.assertEqual(state.data["runs"][-1]["unplayable"], 2)
+
+    def test_a_series_page_without_a_list_of_episodes_is_not_watchable(self):
+        state = state_with((1, "Teaser"))
+        page = title_page("Teaser", seasons=1).replace('"_type":"Episodes"', '"_type":"Other"')
+
+        run(state, FakeSite({eid(1): page}))
+
+        self.assertFalse(state.titles[eid(1)]["playable"])
+
+    def test_a_reread_does_not_count_its_links_twice(self):
+        state = state_with((1, "Show"), (2, "Other"))
+        site = FakeSite({
+            eid(1): title_page("Show", seasons=1, related=[(eid(2), "Other")]),
+            eid(2): title_page("Other"),
+        })
+        run(state, site, pages=1)
+        links = state.titles[eid(2)]["links"]
+        state.titles[eid(1)]["status"] = "queued"
+        state.queue.append(eid(1))
+
+        run(state, site, pages=1, wanted={dp.normalize_title("Show")})
+
+        self.assertEqual(state.titles[eid(2)]["links"], links)
 
     def test_related_titles_join_the_queue_and_count_their_links(self):
         state = state_with((1, "Show 1"), (2, "Show 2"))
@@ -375,6 +423,156 @@ class RunSliceTests(SimpleTestCase):
         self.assertNotIn("Authorization", headers)
 
 
+class JudgedAgainTests(SimpleTestCase):
+    def test_titles_saved_before_pages_were_judged_are_read_again(self):
+        old = {"title": "Old", "source": "catalogue", "first_seen": "x", "links": 4, "status": "ok", "errors": 0,
+               "checked_at": "2026-11-07T16:29:12+00:00", "year": 2020, "seasons": 5, "page_title": "p"}
+        state = crawl.CrawlState({"version": 1, "region": "za", "titles": {eid(1): old}, "queue": [], "runs": []})
+
+        self.assertEqual((state.titles[eid(1)]["status"], state.queue), ("queued", [eid(1)]))
+        self.assertEqual(state.titles[eid(1)]["links"], 4)
+
+    def test_a_judged_title_is_left_alone_and_nothing_is_queued_twice(self):
+        state = state_with((1, "A"), (2, "B"))
+        state.titles[eid(1)].update(status="ok", playable=True, checked_at="2026-11-07T16:29:12+00:00")
+        state.queue.remove(eid(1))
+        del state.titles[eid(2)]["playable"]
+        state.titles[eid(2)]["status"] = "ok"  # unjudged, but already in the queue
+
+        again = crawl.CrawlState(state.data)
+
+        self.assertEqual(again.queue.count(eid(2)), 1)
+        self.assertEqual(again.titles[eid(1)]["status"], "ok")
+
+    def test_stale_titles_are_queued_for_a_fresh_look(self):
+        state = state_with((1, "Old"), (2, "Recent"), (3, "Gone"))
+        for n, when, status in ((1, "2026-09-01T00:00:00+00:00", "ok"), (2, "2026-11-01T00:00:00+00:00", "ok"),
+                                (3, "2026-09-01T00:00:00+00:00", "gone")):
+            state.titles[eid(n)].update(status=status, playable=True, checked_at=when)
+        state.queue.clear()
+
+        self.assertEqual(state.requeue_stale(NOW), 1)
+        self.assertEqual(state.queue, [eid(1)])
+        self.assertEqual(state.requeue_stale(NOW), 0)  # not queued twice
+
+
+class MatchingTests(SimpleTestCase):
+    def read(self, pages, titles):
+        state = state_with(*titles)
+        run(state, FakeSite(pages))
+        return state
+
+    def snapshot(self):
+        return {"titles": [], "scraped_at": "x"}
+
+    def test_only_titles_that_can_be_watched_are_offered_as_candidates(self):
+        state = self.read(
+            {eid(1): title_page("Bluey", seasons=3, year=2018), eid(2): title_page("Gone Here", has_content=False)},
+            [(1, "Bluey"), (2, "Gone Here")],
+        )
+
+        self.assertEqual(
+            crawl.catalogue_entries(state),
+            [{"entity": f"/en-za/browse/{eid(1)}", "title": "Bluey", "collections": ["Crawl"]}],
+        )
+
+    def test_a_crawled_title_matches_what_you_track_without_any_request(self):
+        state = self.read({eid(1): title_page("Bluey", seasons=3, year=2018)}, [(1, "Bluey")])
+        wanted = [("tv:82728", "Bluey", 2018, "tv")]
+
+        def no_network(path):
+            raise AssertionError(path)
+
+        matches = crawl.match_tracked(self.snapshot(), wanted, state, fallback=no_network, delay=0)
+
+        self.assertEqual(matches, {"tv:82728": {"entity": f"/en-za/browse/{eid(1)}", "title": "Bluey"}})
+
+    def test_a_title_that_is_not_carried_here_does_not_match(self):
+        state = self.read({eid(1): title_page("Rookie", has_content=False)}, [(1, "Rookie")])
+        snapshot = {"titles": [{"entity": f"/en-za/browse/{eid(1)}", "title": "Rookie", "collections": []}]}
+
+        matches = crawl.match_tracked(snapshot, [("movie:1", "Rookie", 2018, "movie")], state, delay=0)
+
+        self.assertEqual(matches, {})
+
+    def test_the_right_kind_and_year_are_still_required(self):
+        state = self.read({eid(1): title_page("Elementary", seasons=7, year=2012)}, [(1, "Elementary")])
+
+        matches = crawl.match_tracked(
+            self.snapshot(),
+            [("movie:1", "Elementary", 2012, "movie"), ("tv:2", "Elementary", 1953, "tv")],
+            state,
+            delay=0,
+        )
+
+        self.assertEqual(matches, {})
+
+    def test_a_title_the_crawl_has_not_read_yet_is_left_to_the_fallback(self):
+        state = state_with((1, "Unread"))
+        snapshot = {"titles": [{"entity": f"/en-za/browse/{eid(1)}", "title": "Unread", "collections": []}]}
+        asked = []
+
+        def fallback(path):
+            asked.append(path)
+            return {"year": 2020, "seasons": 1, "related": []}
+
+        matches = crawl.match_tracked(snapshot, [("tv:1", "Unread", 2020, "tv")], state, fallback=fallback, delay=0)
+
+        self.assertEqual(asked, [f"/en-za/browse/{eid(1)}"])
+        self.assertIn("tv:1", matches)
+
+    def test_by_default_an_unread_title_is_not_requested_and_does_not_match(self):
+        state = state_with((1, "Unread"))
+        snapshot = {"titles": [{"entity": f"/en-za/browse/{eid(1)}", "title": "Unread", "collections": []}]}
+
+        self.assertEqual(crawl.match_tracked(snapshot, [("tv:1", "Unread", 2020, "tv")], state, delay=0), {})
+
+    def test_a_kept_match_whose_page_is_gone_or_no_longer_watchable_is_dropped(self):
+        state = self.read(
+            {eid(1): title_page("Bluey", seasons=3), eid(2): title_page("Other", seasons=1, has_content=False)},
+            [(1, "Bluey"), (2, "Other")],
+        )
+        state.titles[eid(1)].update(status="gone")
+        previous = {
+            "tv:1": {"entity": f"/en-za/browse/{eid(1)}", "title": "Bluey"},
+            "tv:2": {"entity": f"/en-za/browse/{eid(2)}", "title": "Other"},
+        }
+
+        matches = crawl.match_tracked(
+            self.snapshot(), [("tv:1", "Bluey", None, "tv"), ("tv:2", "Other", None, "tv")], state,
+            previous=previous, delay=0,
+        )
+
+        self.assertEqual(matches, {})
+
+    def test_the_saved_hub_catalogue_is_not_changed_by_matching(self):
+        state = self.read({eid(1): title_page("Bluey", seasons=3, year=2018)}, [(1, "Bluey")])
+        snapshot = self.snapshot()
+
+        crawl.match_tracked(snapshot, [("tv:1", "Bluey", 2018, "tv")], state, delay=0)
+
+        self.assertEqual(snapshot["titles"], [])
+
+
+class SwitchTests(SimpleTestCase):
+    def test_the_file_switches_the_crawl_on_when_the_environment_is_off(self):
+        with tempfile.TemporaryDirectory() as folder, \
+             override_settings(DISNEYPLUS_CRAWL=False, BASE_DIR=Path(folder)):
+            self.assertFalse(crawl.crawl_enabled())
+            (Path(folder) / "db").mkdir()
+            (Path(folder) / "db" / "disneyplus_crawl.on").write_text("")
+
+            self.assertTrue(crawl.crawl_enabled())
+
+    def test_the_environment_alone_is_enough(self):
+        with tempfile.TemporaryDirectory() as folder, \
+             override_settings(DISNEYPLUS_CRAWL=True, BASE_DIR=Path(folder)):
+            self.assertTrue(crawl.crawl_enabled())
+
+    def test_the_default_budget_is_a_thousand_pages_a_night(self):
+        self.assertEqual(crawl.DEFAULT_PAGES, 1000)
+
+
 class CrawlLockTests(SimpleTestCase):
     def test_the_lock_exists_while_running_and_is_removed_after(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -411,7 +609,7 @@ class CrawlLockTests(SimpleTestCase):
             self.assertIsNone(fresh)
 
 
-class CrawlCommandTests(TestCase):
+class CrawlCommandBase(TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
         self.addCleanup(self.folder.cleanup)
@@ -433,6 +631,8 @@ class CrawlCommandTests(TestCase):
         summary = {"pages": 2, "new_titles": 1, "gone": 0, "failed": 0, "ended": "budget", **fixed}
         return patch.object(crawl, "run_slice", return_value=summary)
 
+
+class CrawlCommandTests(CrawlCommandBase):
     def test_it_is_off_unless_switched_on(self):
         with override_settings(DISNEYPLUS_CRAWL=False), self.fake_slice() as read, \
              self.assertRaisesRegex(CommandError, "switched off"):
@@ -517,3 +717,126 @@ class CrawlCommandTests(TestCase):
             self.call()
 
         self.assertEqual(crawl.CrawlState.load(self.state_file).titles[eid(1)]["status"], "ok")
+
+
+class WhereToWatchUpdateTests(CrawlCommandBase):
+    """After a slice the command matches what you track against everything crawled so far."""
+
+    def setUp(self):
+        super().setUp()
+        state = crawl.CrawlState()
+        state.add_seen(eid(1), "T1", "catalogue", NOW)
+        state.queue.clear()
+        state.titles[eid(1)].update(status="ok", playable=True, year=2018, seasons=2, checked_at=NOW.isoformat())
+        state.save(self.state_file)
+        user = get_user_model().objects.create_user(username="viewer")
+        item = Item.objects.create(media_id="5", source=Sources.TMDB.value, media_type=MediaTypes.TV.value,
+                                   title="T1", image="http://x/i.jpg")
+        TV.objects.create(item=item, user=user, status=Status.PLANNING.value)
+        for target, value in (
+            (command, {"refresh_changed": lambda old, new: list(set(old) | set(new))}),
+        ):
+            patcher = patch.multiple(target, **value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        year = patch("app.management.commands.scrape_disneyplus_za.release_year", return_value=2018)
+        year.start()
+        self.addCleanup(year.stop)
+
+    def saved_matches(self):
+        return (dp.load_snapshot(self.catalogue) or {}).get("matches")
+
+    def test_a_crawled_title_you_track_is_matched_and_saved(self):
+        with override_settings(DISNEYPLUS_CRAWL=True), self.fake_slice():
+            output = self.call()
+
+        self.assertEqual(self.saved_matches(), {"tv:5": {"entity": f"/en-za/browse/{eid(1)}", "title": "T1"}})
+        self.assertIn("1 of 1 tracked titles are on Disney+ ZA.", output)
+        self.assertIn("Where to Watch updated for 1 titles.", output)
+
+    def test_the_saved_hub_catalogue_keeps_only_its_own_titles(self):
+        with override_settings(DISNEYPLUS_CRAWL=True), self.fake_slice():
+            self.call()
+
+        self.assertEqual(len(dp.load_snapshot(self.catalogue)["titles"]), 3)
+
+    def test_nothing_is_rewritten_when_the_matches_have_not_changed(self):
+        with override_settings(DISNEYPLUS_CRAWL=True), self.fake_slice():
+            self.call()
+            with patch.object(command, "refresh_changed") as refresh:
+                output = self.call()
+
+        refresh.assert_not_called()
+        self.assertNotIn("updated", output)
+
+    def test_no_match_leaves_where_to_watch_alone(self):
+        with override_settings(DISNEYPLUS_CRAWL=True), self.fake_slice():
+            output = self.call("--no-match")
+
+        self.assertIsNone(self.saved_matches())
+        self.assertNotIn("tracked titles", output)
+
+    def test_without_a_hub_catalogue_it_says_so_and_carries_on(self):
+        self.catalogue.unlink()
+
+        with override_settings(DISNEYPLUS_CRAWL=True), self.fake_slice():
+            output = self.call()
+
+        self.assertIn("Where to Watch not updated", output)
+
+    def test_when_nothing_new_is_left_titles_read_long_ago_are_checked_again(self):
+        state = crawl.CrawlState.load(self.state_file)
+        state.titles[eid(1)]["checked_at"] = (NOW - timedelta(days=90)).isoformat()
+        state.save(self.state_file)
+
+        with override_settings(DISNEYPLUS_CRAWL=True), self.fake_slice() as read:
+            output = self.call()
+
+        self.assertIn("checking 1 titles last read over a month ago", output)
+        self.assertEqual(read.call_args.args[0].queue, [eid(1)])
+
+    def test_the_run_reports_how_many_pages_were_not_watchable(self):
+        with override_settings(DISNEYPLUS_CRAWL=True), self.fake_slice(unplayable=3):
+            output = self.call()
+
+        self.assertIn("3 not watchable here", output)
+
+    def test_the_file_switch_lets_the_command_run(self):
+        with override_settings(DISNEYPLUS_CRAWL=False), patch.object(crawl, "crawl_enabled", return_value=True), \
+             self.fake_slice() as read:
+            self.call()
+
+        read.assert_called_once()
+
+
+class WeeklyScrapeUsesTheCrawlTests(TestCase):
+    """The weekly hub scrape matches against what the crawl already read, instead of re-fetching it."""
+
+    def test_a_title_only_the_crawl_found_is_matched_without_fetching_its_page(self):
+        scrape = "app.management.commands.scrape_disneyplus_za"
+        with tempfile.TemporaryDirectory() as folder:
+            state_file, catalogue = Path(folder) / "crawl.json", Path(folder) / "c.json"
+            state = crawl.CrawlState()
+            state.add_seen(eid(1), "Reservation Dogs", "related:x", NOW)
+            state.queue.clear()
+            state.titles[eid(1)].update(status="ok", playable=True, year=2021, seasons=3, checked_at=NOW.isoformat())
+            state.save(state_file)
+            hub = {
+                "scraped_at": "2026-11-08T10:00:00+00:00", "region": "za", "pages_read": 7,
+                "titles": [{"entity": f"/e{i}", "title": f"T{i}", "collections": []} for i in range(150)],
+            }
+            user = get_user_model().objects.create_user(username="viewer")
+            item = Item.objects.create(media_id="129", source=Sources.TMDB.value, media_type=MediaTypes.TV.value,
+                                       title="Reservation Dogs", image="http://x/i.jpg")
+            TV.objects.create(item=item, user=user, status=Status.PLANNING.value)
+
+            with patch.object(crawl, "state_path", return_value=state_file), \
+                 patch.object(dp, "fetch_catalogue", return_value=hub), \
+                 patch.object(dp, "entity_details", side_effect=AssertionError("fetched a page")), \
+                 patch(f"{scrape}.release_year", return_value=2021), \
+                 patch(f"{scrape}.refresh_changed", return_value=["tv:129"]):
+                call_command("scrape_disneyplus_za", output=str(catalogue), stdout=io.StringIO())
+
+            saved = dp.load_snapshot(catalogue)
+            self.assertEqual(saved["matches"], {"tv:129": {"entity": f"/en-za/browse/{eid(1)}", "title": "Reservation Dogs"}})
+            self.assertEqual(len(saved["titles"]), 150)  # the crawl's titles are not copied into the hub catalogue

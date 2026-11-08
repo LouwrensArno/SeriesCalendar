@@ -387,6 +387,8 @@ TMDB_API = config(
 TMDB_NSFW = config("TMDB_NSFW", default=False, cast=bool)
 # Off unless switched on: the slow crawl of Disney+ South Africa's public title pages
 DISNEYPLUS_CRAWL = config("DISNEYPLUS_CRAWL", default=False, cast=bool)
+# When the nightly slice starts, in the server's time zone (22:00 UTC is midnight in South Africa)
+DISNEYPLUS_CRAWL_HOUR = config("DISNEYPLUS_CRAWL_HOUR", default=22, cast=int)
 TMDB_LANG = config("TMDB_LANG", default="en")
 
 TVDB_API = config(
@@ -611,6 +613,11 @@ CELERY_BEAT_SCHEDULE = {
     "refresh_tv_show_details": {
         "task": "Refresh TV show details",
         "schedule": 60 * 60 * 24,  # every 24 hours
+    },
+    # does nothing unless the Disney+ crawl is switched on
+    "crawl_disneyplus_za": {
+        "task": "Crawl Disney+ South Africa",
+        "schedule": crontab(hour=DISNEYPLUS_CRAWL_HOUR, minute=0),
     },
 }
 

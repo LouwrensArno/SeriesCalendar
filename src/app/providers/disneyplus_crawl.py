@@ -11,6 +11,10 @@ site objects (429, 403, or a run of errors).
 
 Reads the public pages only: no login, no cookies, one request at a time, an honest
 User-Agent, a pause between requests, and it refuses to run unless switched on.
+
+What it learns also feeds Where to Watch: a title counts as on Disney+ only if its page
+says the service really carries it (see `disneyplus_za.is_playable`), because a title that
+is not carried in South Africa still gets a page, just an empty one.
 """
 
 import json
@@ -23,6 +27,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import requests
+from django.conf import settings
 
 from app.providers import disneyplus_za as dp
 
@@ -31,7 +36,7 @@ logger = logging.getLogger(__name__)
 STATE_VERSION = 1
 LANDING = "/en-za/browse/"
 
-DEFAULT_PAGES = 300  # per run
+DEFAULT_PAGES = 1000  # per run
 DEFAULT_DELAY = (4.0, 6.0)  # seconds between requests, picked at random
 SAVE_EVERY = 25  # pages between saves, so a crash loses little
 MAX_ERRORS_PER_TITLE = 3  # then it is set aside
@@ -40,12 +45,28 @@ DEFAULT_PAUSE_429 = timedelta(hours=1)
 PAUSE_403 = timedelta(hours=24)
 PAUSE_FAILURES = timedelta(hours=6)
 MAX_PAUSE = timedelta(hours=24)
-LOCK_STALE_AFTER = timedelta(hours=3)
+LOCK_STALE_AFTER = timedelta(hours=6)
+STALE_AFTER = timedelta(days=30)  # a title read longer ago than this is read again
 KEEP_RUNS = 20
 
 
 class CrawlLocked(dp.CatalogueError):
     """Another crawl is running (or died recently): never run two at once."""
+
+
+def state_path():
+    """Where the crawl keeps what it has learned: next to the database."""
+    return settings.BASE_DIR / "db" / "disneyplus_za_crawl.json"
+
+
+def switch_path():
+    """The file whose presence switches the crawl on (for when no environment can be set)."""
+    return settings.BASE_DIR / "db" / "disneyplus_crawl.on"
+
+
+def crawl_enabled():
+    """Is the crawl switched on: DISNEYPLUS_CRAWL=True, or the switch file exists."""
+    return bool(settings.DISNEYPLUS_CRAWL) or switch_path().exists()
 
 
 def entity_id(path):
@@ -80,6 +101,15 @@ class CrawlState:
     def __init__(self, data=None):
         """Wrap saved data (or start empty)."""
         self.data = data if data and data.get("version") == STATE_VERSION else _fresh_state()
+        self._requeue_unjudged()
+
+    def _requeue_unjudged(self):
+        """Read again the titles saved before pages were judged on whether they can be watched."""
+        queued = set(self.queue)
+        for entity, entry in self.titles.items():
+            if entry["status"] == "ok" and "playable" not in entry and entity not in queued:
+                entry["status"] = "queued"
+                self.queue.append(entity)
 
     @classmethod
     def load(cls, path):
@@ -107,14 +137,15 @@ class CrawlState:
         """Ids still to read."""
         return self.data["queue"]
 
-    def add_seen(self, entity, title, source, now):
+    def add_seen(self, entity, title, source, now, *, count_link=True):
         """Note a title we have seen. A new one joins the queue; a repeat counts as a link.
 
         How many pages link to a title is used to decide what to read first.
         """
         known = self.titles.get(entity)
         if known:
-            known["links"] += 1
+            if count_link:
+                known["links"] += 1
             return False
         self.titles[entity] = {
             "title": title,
@@ -127,9 +158,26 @@ class CrawlState:
             "year": None,
             "seasons": None,
             "page_title": "",
+            "kind": None,
+            "playable": None,  # True/False once read: can it really be watched here?
         }
         self.queue.append(entity)
         return True
+
+    def requeue_stale(self, now, max_age=STALE_AFTER):
+        """Queue the titles read more than `max_age` ago, to check they are still there.
+
+        Returns how many. The crawl calls this once it has nothing new left to read.
+        """
+        queued = set(self.queue)
+        cutoff = now - max_age
+        stale = 0
+        for entity, entry in self.titles.items():
+            if entry["status"] == "ok" and entity not in queued and datetime.fromisoformat(entry["checked_at"]) < cutoff:
+                entry["status"] = "queued"
+                self.queue.append(entity)
+                stale += 1
+        return stale
 
     def seed_from_catalogue(self, snapshot, now):
         """Add the titles of the saved hub catalogue. Returns how many were new."""
@@ -176,7 +224,8 @@ class CrawlState:
         by_status = {}
         for entry in self.titles.values():
             by_status[entry["status"]] = by_status.get(entry["status"], 0) + 1
-        return {"titles": len(self.titles), "queued": len(self.queue), **by_status}
+        playable = sum(1 for entry in self.titles.values() if entry.get("playable"))
+        return {"titles": len(self.titles), "queued": len(self.queue), **by_status, **({"playable": playable} if playable else {})}
 
 
 @contextmanager
@@ -230,11 +279,12 @@ def run_slice(  # noqa: PLR0913
     `wanted` is a set of normalised titles you track, which are read first. `save` is
     called every few pages and at the end, even if something goes wrong part way.
     Returns a summary: pages read, new titles found, pages that no longer exist, and why
-    it stopped ("budget", "queue empty", "paused", "429", "403", "errors").
+    it stopped ("budget", "queue empty", "paused", "429", "403", "errors"). `unplayable` counts
+    the pages read that turned out not to be something you can watch.
     """
     session = session or requests.Session()
     now = now or datetime.now(UTC)
-    summary = {"pages": 0, "new_titles": 0, "gone": 0, "failed": 0, "ended": "budget"}
+    summary = {"pages": 0, "new_titles": 0, "gone": 0, "failed": 0, "unplayable": 0, "ended": "budget"}
 
     until = state.paused_until(now)
     if until:
@@ -305,7 +355,7 @@ def run_slice(  # noqa: PLR0913
             state.requeue(entity)
         state.data["runs"] = [
             *state.data["runs"][-(KEEP_RUNS - 1):],
-            {"when": _stamp(now), **{k: summary[k] for k in ("pages", "new_titles", "gone", "failed", "ended")}},
+            {"when": _stamp(now), **{k: summary[k] for k in ("pages", "new_titles", "gone", "failed", "unplayable", "ended")}},
         ]
         if save:
             save(state)
@@ -322,12 +372,68 @@ def _learn(state, entity, entry, html, now, summary):
         )
         raise dp.CatalogueError(msg)
     details = dp.parse_entity(html)
+    first_read = entry["checked_at"] is None  # a re-read must not count its links twice
     entry.update(
         status="ok",
         checked_at=_stamp(now),
         year=details["year"],
         seasons=details["seasons"],
         page_title=name[:100],
+        kind=details["kind"],
+        playable=dp.is_playable(details),
     )
+    summary["unplayable"] += not entry["playable"]
     for path, title in details["related"]:
-        summary["new_titles"] += state.add_seen(entity_id(path), title, f"related:{entity}", now)
+        summary["new_titles"] += state.add_seen(
+            entity_id(path), title, f"related:{entity}", now, count_link=first_read,
+        )
+
+
+def catalogue_entries(state):
+    """The titles the crawl found that can really be watched, in the hub catalogue's shape."""
+    return [
+        {"entity": entity_path(entity), "title": entry["title"], "collections": ["Crawl"]}
+        for entity, entry in state.titles.items()
+        if entry.get("playable")
+    ]
+
+
+def known_details(state, fallback):
+    """A `fetch_details` for `match_titles` that uses what the crawl already read.
+
+    A title the crawl has judged costs no request. One it hasn't is passed to `fallback`
+    (which may fetch the page, or give up). A title whose page is gone raises `TitleGone`.
+    """
+
+    def fetch(path):
+        entry = state.titles.get(entity_id(path))
+        if entry and entry["status"] == "gone":
+            msg = f"{path} no longer exists"
+            raise dp.TitleGone(msg)
+        if entry and entry.get("playable") is not None and entry["checked_at"]:
+            if not entry["playable"]:
+                return {"has_content": False, "year": entry["year"], "seasons": entry["seasons"], "related": []}
+            return {"year": entry["year"], "seasons": entry["seasons"], "related": []}
+        return fallback(path)
+
+    return fetch
+
+
+def match_tracked(snapshot, wanted, state, *, previous=None, fallback=None, delay=2.0, sleep=time.sleep):
+    """Match what you track against the hub catalogue and everything the crawl has found.
+
+    Works like `disneyplus_za.match_titles`, but the crawl's titles are candidates too and
+    the pages it has read are not fetched again. `fallback(path)` is used for a title the
+    crawl hasn't read yet; by default it gives up, so nothing is requested. The saved hub
+    `snapshot` is left as it was.
+    """
+    known = {entry["entity"] for entry in snapshot["titles"]}
+    extras = [entry for entry in catalogue_entries(state) if entry["entity"] not in known]
+    merged = {**snapshot, "titles": [*snapshot["titles"], *extras]}
+    if fallback is None:
+        def fallback(path):
+            msg = f"{path} has not been read yet"
+            raise dp.CatalogueError(msg)
+    return dp.match_titles(
+        merged, wanted, previous=previous, fetch_details=known_details(state, fallback), delay=delay, sleep=sleep,
+    )

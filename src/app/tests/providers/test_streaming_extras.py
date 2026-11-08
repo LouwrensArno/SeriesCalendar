@@ -191,6 +191,14 @@ class EntityMatchesTests(SimpleTestCase):
         self.assertTrue(dp.entity_matches("tv", 2018, {"seasons": 1, "year": None}))
         self.assertTrue(dp.entity_matches("tv", None, {"seasons": 1, "year": 1999}))
 
+    def test_a_page_for_something_that_cannot_be_watched_here_never_matches(self):
+        self.assertFalse(dp.entity_matches("movie", 2024, {"seasons": None, "year": 2024, "has_content": False}))
+        self.assertFalse(dp.entity_matches("movie", 2024, {"seasons": None, "year": 2024, "kind": "ItemList"}))
+        self.assertFalse(dp.entity_matches("tv", 2018, {"seasons": 1, "year": 2018, "has_episodes": False}))
+        self.assertTrue(
+            dp.entity_matches("tv", 2018, {"seasons": 1, "year": 2018, "has_content": True, "has_episodes": True}),
+        )
+
 
 class MatchTitlesTests(SimpleTestCase):
     SNAP = {"titles": [

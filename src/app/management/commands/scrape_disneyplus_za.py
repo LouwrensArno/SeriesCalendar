@@ -4,7 +4,7 @@ from django.core.management.base import BaseCommand, CommandError
 from django.db.models import Q
 
 from app.models import Item, MediaTypes, Sources, TVShowDetails
-from app.providers import disneyplus_za, services
+from app.providers import disneyplus_crawl, disneyplus_za, services
 
 
 def default_path():
@@ -60,6 +60,20 @@ def refresh_changed(old, new):
     return changed
 
 
+def wanted_titles():
+    """What to match, as `disneyplus_za.match_titles` wants it: (key, title, year, media type)."""
+    return [
+        (
+            f"{'tv' if item.media_type == MediaTypes.TV.value else 'movie'}:{item.media_id}",
+            item.title,
+            # the year is only looked up (on TMDB) when a name match has to be checked
+            lambda item=item: release_year(item),
+            "tv" if item.media_type == MediaTypes.TV.value else "movie",
+        )
+        for item in tracked_items()
+    ]
+
+
 class Command(BaseCommand):
     """Read the public Disney+ South Africa catalogue, save it and match your titles."""
 
@@ -100,22 +114,25 @@ class Command(BaseCommand):
         previous = disneyplus_za.load_snapshot(path) or {}
         matches = previous.get("matches") or {}
         if not options["no_match"]:
-            wanted = [
-                (
-                    f"{'tv' if item.media_type == MediaTypes.TV.value else 'movie'}:{item.media_id}",
-                    item.title,
-                    # the year is only looked up (on TMDB) when a name match has to be checked
-                    lambda item=item: release_year(item),
-                    "tv" if item.media_type == MediaTypes.TV.value else "movie",
+            wanted = wanted_titles()
+            crawl_state = disneyplus_crawl.CrawlState.load(disneyplus_crawl.state_path())
+            if crawl_state.titles:
+                # what the nightly crawl has already read is used, not fetched again
+                matches = disneyplus_crawl.match_tracked(
+                    snapshot,
+                    wanted,
+                    crawl_state,
+                    previous=matches,
+                    fallback=disneyplus_za.entity_details,
+                    delay=options["delay"],
                 )
-                for item in tracked_items()
-            ]
-            matches = disneyplus_za.match_titles(
-                snapshot,
-                wanted,
-                previous=matches,
-                delay=options["delay"],
-            )
+            else:
+                matches = disneyplus_za.match_titles(
+                    snapshot,
+                    wanted,
+                    previous=matches,
+                    delay=options["delay"],
+                )
             self.stdout.write(f"{len(matches)} of {len(wanted)} tracked titles are on Disney+ ZA.")
         snapshot["matches"] = matches
 

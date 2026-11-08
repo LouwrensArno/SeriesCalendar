@@ -102,11 +102,63 @@ class ParsePageTests(SimpleTestCase):
         self.assertEqual(name, "Oops")
 
 
+# The markers real pages carry (trimmed from live pages read on 2026-11-08).
+SERIES_PAGE = (
+    '{"hasContent":true,"stitchDocument":{"mainContent":[{"_type":"DetailEntityHero","releaseYear":"2021 – 2023",'
+    '"seasonsAvailable":"3 Seasons"},{"_type":"Episodes","title":"EPISODES"},'
+    '{"_type":"Metadata","ldJSON":{"@context":"http://schema.org","@graph":[{"@type":"TVSeries","datePublished":"2021"},'
+    '{"@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","item":{"@type":"WebPage"}}]}]}}]}}'
+    "<span>3 Seasons</span>"
+)
+MOVIE_PAGE = (
+    '{"hasContent":true,"stitchDocument":{"mainContent":[{"_type":"DetailEntityHero","releaseYear":"2026"},'
+    '{"_type":"Metadata","ldJSON":{"@graph":[{"@type":"Movie"},{"@type":"BreadcrumbList"}]}}]}}'
+)
+TEAM_PAGE = (
+    '{"hasContent":true,"stitchDocument":{"mainContent":[{"_type":"Metadata","ldJSON":{"@graph":[{"@type":"ItemList"}]}}]}}'
+)
+EMPTY_PAGE = '{"hasContent":false,"stitchDocument":{"mainContent":[]},"region":"za"}'
+
+
 class EntityPageTests(SimpleTestCase):
     def test_reads_year_and_seasons(self):
         html = '<span>• 10 Seasons</span><script>{"releaseYear":"2018"}</script>'
+        details = dp.parse_entity(html)
 
-        self.assertEqual(dp.parse_entity(html), {"year": 2018, "seasons": 10, "related": []})
+        self.assertEqual((details["year"], details["seasons"], details["related"]), (2018, 10, []))
+
+    def test_a_series_page_the_service_really_carries(self):
+        details = dp.parse_entity(SERIES_PAGE)
+
+        self.assertEqual(
+            (details["has_content"], details["kind"], details["has_episodes"], details["seasons"], details["year"]),
+            (True, "TVSeries", True, 3, 2021),
+        )
+        self.assertTrue(dp.is_playable(details))
+
+    def test_a_film_page_has_no_episodes_and_is_still_playable(self):
+        details = dp.parse_entity(MOVIE_PAGE)
+
+        self.assertEqual((details["kind"], details["has_episodes"], details["seasons"]), ("Movie", False, None))
+        self.assertTrue(dp.is_playable(details))
+
+    def test_the_empty_page_of_a_title_not_carried_here_is_not_playable(self):
+        details = dp.parse_entity(EMPTY_PAGE)
+
+        self.assertEqual((details["has_content"], details["kind"]), (False, None))
+        self.assertFalse(dp.is_playable(details))
+
+    def test_a_page_that_is_not_a_show_or_film_is_not_playable(self):
+        self.assertFalse(dp.is_playable(dp.parse_entity(TEAM_PAGE)))
+
+    def test_a_series_page_without_episodes_is_not_playable(self):
+        page = SERIES_PAGE.replace('"_type":"Episodes"', '"_type":"Nothing"')
+
+        self.assertFalse(dp.is_playable(dp.parse_entity(page)))
+
+    def test_what_a_page_does_not_say_does_not_count_against_it(self):
+        self.assertTrue(dp.is_playable({"year": 2018, "seasons": 10, "related": []}))
+        self.assertTrue(dp.is_playable(dp.parse_entity("nothing")))
 
     def test_collects_the_related_titles_the_page_links_to(self):
         html = page("9-1-1", tiles=[("9-1-1: Lone Star", E2), ("Grey's Anatomy", E3)]) + "10 Seasons"
@@ -117,13 +169,15 @@ class EntityPageTests(SimpleTestCase):
         )
 
     def test_one_season_and_numeric_year(self):
-        self.assertEqual(
-            dp.parse_entity('1 Season {"year":2024}'),
-            {"year": 2024, "seasons": 1, "related": []},
-        )
+        details = dp.parse_entity('1 Season {"year":2024}')
+
+        self.assertEqual((details["year"], details["seasons"]), (2024, 1))
 
     def test_missing_fields_are_none(self):
-        self.assertEqual(dp.parse_entity("nothing"), {"year": None, "seasons": None, "related": []})
+        self.assertEqual(
+            dp.parse_entity("nothing"),
+            {"year": None, "seasons": None, "has_content": None, "kind": None, "has_episodes": False, "related": []},
+        )
 
 
 class NormalizeTitleTests(SimpleTestCase):
@@ -280,10 +334,9 @@ class EntityDetailsTests(SimpleTestCase):
     def test_fetches_one_title_page(self):
         session = FakeSession({E1: '10 Seasons {"releaseYear":"2018"}'})
 
-        self.assertEqual(
-            dp.entity_details(E1, session=session),
-            {"year": 2018, "seasons": 10, "related": []},
-        )
+        details = dp.entity_details(E1, session=session)
+
+        self.assertEqual((details["year"], details["seasons"], details["related"]), (2018, 10, []))
         self.assertEqual(len(session.requests), 1)
 
     def test_a_page_that_is_gone_is_told_apart_from_an_error(self):
