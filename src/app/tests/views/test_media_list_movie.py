@@ -9,6 +9,7 @@ from django.utils import timezone
 
 from app.management.commands.scrape_disneyplus_za import refresh_changed
 from app.models import (
+    Book,
     Item,
     MediaTypes,
     Movie,
@@ -101,6 +102,35 @@ class MovieListTests(TestCase):
         self.user.save(update_fields=["watch_provider_region"])
 
         self.assertNotIn("image.tmdb.org/t/p/w500/hulu.png", self.page())
+
+    def test_movies_have_no_start_or_end_date_columns_but_other_lists_do(self):
+        """The release year replaces them for movies only."""
+        content = self.page()
+        book = Item.objects.create(
+            media_id="1",
+            source=Sources.OPENLIBRARY.value,
+            media_type=MediaTypes.BOOK.value,
+            title="A Book",
+            image="http://example.com/image.jpg",
+        )
+        Book.objects.create(item=book, user=self.user, status=Status.PLANNING.value)
+        book_url = reverse("medialist", args=[self.user.username, MediaTypes.BOOK.value])
+        books = self.client.get(book_url, {"layout": "table"}).content.decode()
+
+        self.assertNotIn(">Start Date</th>", content)
+        self.assertNotIn(">End Date</th>", content)
+        self.assertIn(">Start Date</th>", books)
+        self.assertIn(">End Date</th>", books)
+
+    def test_each_movie_row_has_as_many_cells_as_the_header(self):
+        """Dropping the date columns keeps the header and the rows lined up."""
+        content = self.page()
+
+        headers = content.split("<thead")[1].split("</thead>")[0].count("<th")
+        row = content.split("Known Movie</a>")[1].split("</tr>")[0]
+        first_cells = content.split("<tbody>")[1].split("</tr>")[0].count("<td")
+        self.assertEqual(first_cells, headers)
+        self.assertIn("<td", row)
 
     def test_other_lists_do_not_get_the_movie_columns(self):
         """Only movies have a Year / Where to Watch column in the generic table."""

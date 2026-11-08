@@ -123,20 +123,23 @@
 
       <td class="p-2 text-center">{{ media.status|media_status_readable }}</td>
 
-      {% if media.start_date %}
-        <td class="p-2 text-center">{{ media.start_date|date_format:target_user }}</td>
-      {% else %}
-        <td class="p-2 text-center">
-          <span class="text-gray-500">-</span>
-        </td>
-      {% endif %}
+      {# Movies don't show start/end dates: the release year above is what matters #}
+      {% if media_type != MediaTypes.MOVIE.value %}
+        {% if media.start_date %}
+          <td class="p-2 text-center">{{ media.start_date|date_format:target_user }}</td>
+        {% else %}
+          <td class="p-2 text-center">
+            <span class="text-gray-500">-</span>
+          </td>
+        {% endif %}
 
-      {% if media.end_date %}
-        <td class="p-2 text-center">{{ media.end_date|date_format:target_user }}</td>
-      {% else %}
-        <td class="p-2 text-center">
-          <span class="text-gray-500">-</span>
-        </td>
+        {% if media.end_date %}
+          <td class="p-2 text-center">{{ media.end_date|date_format:target_user }}</td>
+        {% else %}
+          <td class="p-2 text-center">
+            <span class="text-gray-500">-</span>
+          </td>
+        {% endif %}
       {% endif %}
     {% endif %}
   </tr>

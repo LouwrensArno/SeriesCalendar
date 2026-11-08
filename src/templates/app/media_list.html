@@ -169,8 +169,10 @@
                   <th class="p-2 text-center">{% trans "Progress" %}</th>
                 {% endif %}
                 <th class="p-2 text-center">{% trans "Status" %}</th>
-                <th class="p-2 text-center">{% trans "Start Date" %}</th>
-                <th class="p-2 text-center">{% trans "End Date" %}</th>
+                {% if media_type != MediaTypes.MOVIE.value %}
+                  <th class="p-2 text-center">{% trans "Start Date" %}</th>
+                  <th class="p-2 text-center">{% trans "End Date" %}</th>
+                {% endif %}
               {% endif %}
             </tr>
           </thead>
